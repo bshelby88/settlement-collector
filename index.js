@@ -21,28 +21,76 @@ app.get("/status", (_req, res) => res.sendFile(path.join(__dirname, "status.html
 
 app.get("/proof", (_req, res) => res.sendFile(path.join(__dirname, "proof.html")));
 
-app.get("/ledger", (_req, res) => res.sendFile(path.join(__dirname, "ledger.html")));
+app.get("/ledger.html", (_req, res) => res.sendFile(path.join(__dirname, "ledger.html")));
+
+// Canonical short link — 302 to the canonical /ledger.html page.
+app.get("/ledger", (_req, res) => res.redirect(302, "/ledger.html"));
 
 // Public sales ledger (JSON) — straight from our own settlement records.
+// TRUTH FIX (Nov 11): external vs internal split. RAEN-owned wallets
+// (raen-wallets.json) are internal test traffic: they never inflate
+// distinct_external_payers or total_external_usdc.
+const RAEN_WALLETS_FILE = path.join(__dirname, "raen-wallets.json");
+function loadInternalWallets() {
+  const fallback = [
+    "0xfbc0eb7811d477e55261d956df39f0046e192240", // AgentCash payer
+    "0x9b8a27e03ceba490953cda8ab1291c0e13baf72f", // RAEN treasury (payTo)
+  ];
+  try {
+    const cfg = JSON.parse(fs.readFileSync(RAEN_WALLETS_FILE, "utf8"));
+    if (Array.isArray(cfg.internal_wallets) && cfg.internal_wallets.length) {
+      return { set: new Set(cfg.internal_wallets.map(w => String(w).toLowerCase())), labels: cfg._labels || {} };
+    }
+  } catch (e) { console.error("raen-wallets.json load failed, using fallback:", e.message); }
+  return { set: new Set(fallback), labels: {} };
+}
+const internalWallets = loadInternalWallets();
+const isInternalPayer = (p) => Boolean(p) && internalWallets.set.has(String(p).toLowerCase());
+
 app.get("/ledger.json", (_req, res) => {
   const settled = events.filter(e => e.event === "settled");
   const perService = {};
-  const payers = new Set();
-  let total = 0;
+  const externalPayers = new Set();
+  let totalExternal = 0, totalInternal = 0, internalCount = 0, unattributed = 0;
   let lastUpdated = 0;
+  const transactions = [];
   for (const e of settled) {
-    total += e.price_usd || 0;
+    const amount = e.price_usd || 0;
     if (e.ts > lastUpdated) lastUpdated = e.ts;
-    if (e.payer) payers.add(e.payer.toLowerCase());
-    const s = (perService[e.service] ||= { settled_tx_count: 0, settled_usdc: 0 });
+    const internal = isInternalPayer(e.payer);
+    if (!e.payer) unattributed += 1;
+    if (internal) { totalInternal += amount; internalCount += 1; }
+    else {
+      totalExternal += amount;
+      if (e.payer) externalPayers.add(e.payer.toLowerCase());
+    }
+    const s = (perService[e.service] ||= { settled_tx_count: 0, settled_usdc: 0, settled_usdc_external: 0, settled_usdc_internal: 0 });
     s.settled_tx_count += 1;
-    s.settled_usdc = Math.round((s.settled_usdc + (e.price_usd || 0)) * 10000) / 10000;
+    s.settled_usdc = Math.round((s.settled_usdc + amount) * 10000) / 10000;
+    if (internal) s.settled_usdc_internal = Math.round((s.settled_usdc_internal + amount) * 10000) / 10000;
+    else s.settled_usdc_external = Math.round((s.settled_usdc_external + amount) * 10000) / 10000;
+    transactions.push({
+      service: e.service, route: e.route, ts: e.ts,
+      amount_usd: amount, payer: e.payer || null, tx: e.tx || null,
+      classification: internal ? "internal" : (e.payer ? "external" : "unattributed"),
+      payer_label: internal
+        ? (internalWallets.labels[String(e.payer).toLowerCase()] || "RAEN test")
+        : (e.payer ? "external" : "unattributed"),
+    });
   }
+  const r4 = (n) => Math.round(n * 10000) / 10000;
   res.json({
-    total_settled_usdc: Math.round(total * 10000) / 10000,
+    total_settled_usdc: r4(totalExternal + totalInternal),
+    total_external_usdc: r4(totalExternal),
+    total_internal_usdc: r4(totalInternal),
     settled_tx_count: settled.length,
-    distinct_payers: payers.size,
+    settled_tx_count_external: settled.length - internalCount - unattributed,
+    settled_tx_count_internal: internalCount,
+    settled_tx_count_unattributed: unattributed,
+    distinct_payers: externalPayers.size,
+    distinct_external_payers: externalPayers.size,
     per_service: perService,
+    transactions: transactions.slice(-500).reverse(),
     last_updated: lastUpdated || null,
   });
 });

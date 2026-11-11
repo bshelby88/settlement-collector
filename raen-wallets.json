@@ -1,0 +1,11 @@
+{
+  "_comment": "RAEN-owned wallets. Settlements from these addresses are internal test traffic and must NEVER count as external revenue or distinct external payers in /ledger.json. Keep lowercase; deployed copy lives beside settlement-collector/index.js, canonical copy at RAEN/ops/raen-wallets.json.",
+  "internal_wallets": [
+    "0xfbc0eb7811d477e55261d956df39f0046e192240",
+    "0x9b8a27e03ceba490953cda8ab1291c0e13baf72f"
+  ],
+  "_labels": {
+    "0xfbc0eb7811d477e55261d956df39f0046e192240": "RAEN test (AgentCash payer)",
+    "0x9b8a27e03ceba490953cda8ab1291c0e13baf72f": "RAEN treasury (payTo)"
+  }
+}
