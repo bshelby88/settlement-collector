@@ -1,0 +1,23 @@
+{
+  "_comment": "RAEN client value-ledger config (STACI, Nov 11 2026). value_per_call = $ assigned to one settled call for the client-facing report. hours_per_call = human-hours that task would have cost manually (estimated-hours-saved heuristic).",
+  "services": {
+    "booking-agent":     { "value_per_call": 8.00,  "hours_per_call": 0.50, "task_type": "call handling / booking" },
+    "lead-intake":       { "value_per_call": 12.00, "hours_per_call": 0.40, "task_type": "lead qualification" },
+    "dispute-letter":    { "value_per_call": 0.75,  "hours_per_call": 0.75, "task_type": "dispute letter drafting" },
+    "invoice-parser":    { "value_per_call": 2.50,  "hours_per_call": 0.25, "task_type": "document processing" },
+    "faq-agent":         { "value_per_call": 3.00,  "hours_per_call": 0.20, "task_type": "customer support" }
+  },
+  "clients": {
+    "acme-demo": {
+      "name": "Acme Demo Services",
+      "services": ["booking-agent", "lead-intake", "faq-agent"],
+      "payers": ["acme-demo"],
+      "email_recipients": ["ops@royalruby.io"]
+    }
+  },
+  "defaults": {
+    "value_per_call": 1.00,
+    "hours_per_call": 0.25,
+    "task_type": "agent task"
+  }
+}
