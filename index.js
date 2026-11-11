@@ -51,7 +51,7 @@ app.get("/ledger.json", (_req, res) => {
   const settled = events.filter(e => e.event === "settled");
   const perService = {};
   const externalPayers = new Set();
-  let totalExternal = 0, totalInternal = 0, internalCount = 0, unattributed = 0;
+  let totalExternal = 0, totalInternal = 0, totalUnattributed = 0, internalCount = 0, unattributed = 0;
   let lastUpdated = 0;
   const transactions = [];
   for (const e of settled) {
@@ -60,14 +60,16 @@ app.get("/ledger.json", (_req, res) => {
     const internal = isInternalPayer(e.payer);
     if (!e.payer) unattributed += 1;
     if (internal) { totalInternal += amount; internalCount += 1; }
+    else if (!e.payer) { totalUnattributed += amount; } // TRUTH: unattributed is NOT external revenue
     else {
       totalExternal += amount;
-      if (e.payer) externalPayers.add(e.payer.toLowerCase());
+      externalPayers.add(e.payer.toLowerCase());
     }
-    const s = (perService[e.service] ||= { settled_tx_count: 0, settled_usdc: 0, settled_usdc_external: 0, settled_usdc_internal: 0 });
+    const s = (perService[e.service] ||= { settled_tx_count: 0, settled_usdc: 0, settled_usdc_external: 0, settled_usdc_internal: 0, settled_usdc_unattributed: 0 });
     s.settled_tx_count += 1;
     s.settled_usdc = Math.round((s.settled_usdc + amount) * 10000) / 10000;
     if (internal) s.settled_usdc_internal = Math.round((s.settled_usdc_internal + amount) * 10000) / 10000;
+    else if (!e.payer) s.settled_usdc_unattributed = Math.round((s.settled_usdc_unattributed + amount) * 10000) / 10000;
     else s.settled_usdc_external = Math.round((s.settled_usdc_external + amount) * 10000) / 10000;
     transactions.push({
       service: e.service, route: e.route, ts: e.ts,
@@ -80,15 +82,19 @@ app.get("/ledger.json", (_req, res) => {
   }
   const r4 = (n) => Math.round(n * 10000) / 10000;
   res.json({
-    total_settled_usdc: r4(totalExternal + totalInternal),
+    total_settled_usdc: r4(totalExternal + totalInternal + totalUnattributed),
     total_external_usdc: r4(totalExternal),
     total_internal_usdc: r4(totalInternal),
+    total_unattributed_usdc: r4(totalUnattributed),
     settled_tx_count: settled.length,
     settled_tx_count_external: settled.length - internalCount - unattributed,
     settled_tx_count_internal: internalCount,
     settled_tx_count_unattributed: unattributed,
     distinct_payers: externalPayers.size,
     distinct_external_payers: externalPayers.size,
+    // TRUTH: total_settled_usdc is the sum of all settled events. External revenue
+    // is ONLY payer-attributed, non-RAEN settlements. Unattributed settlements
+    // (no payer identity) are reported separately and never counted as external.
     per_service: perService,
     transactions: transactions.slice(-500).reverse(),
     last_updated: lastUpdated || null,
