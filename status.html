@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>RAEN x402 Fleet Status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:ui-monospace,monospace;background:#0d1117;color:#e6edf3;margin:2rem}
+h1{font-size:1.2rem} h1 span{color:#58a6ff}
+table{border-collapse:collapse;margin-top:1rem;width:100%;max-width:720px}
+td,th{padding:.5rem .8rem;border-bottom:1px solid #21262d;text-align:left}
+.ok{color:#3fb950}.down{color:#f85149}.slow{color:#d29922}.chk{color:#8b949e}
+#t{color:#8b949e;font-size:.8rem}
+</style></head><body>
+<h1>RAEN x402 Fleet Status <span>/ status.raen x402 services</span></h1>
+<p id="t">probing…</p>
+<table><thead><tr><th>Service</th><th>Status</th><th>Latency</th><th>Detail</th></tr></thead>
+<tbody id="rows"><tr><td class="chk">checking services…</td></tr></tbody></table>
+<script>
+const SERVICES=["briefsnap-x402","contract-eye-x402","dispatch-x402","dispute-forge-x402",
+"escrow-x402","nanobanana-x402","nft-alpha-x402","royal-ruby-x402","sentry-forge-x402","settlement-collector","suprapack-x402","tradingagents-x402","vault-pro-x402","x402-enterprise"];
+async function probe(name){
+  const t0=performance.now();
+  try{
+    const r=await fetch(`https://${name}.fly.dev/health`,{signal:AbortSignal.timeout(8000)});
+    const ms=Math.round(performance.now()-t0);
+    let detail=""; try{detail=JSON.stringify(JSON.parse(await r.text())).slice(0,80)}catch{detail="(non-json)"}
+    return {name,ok:r.ok,ms,detail};
+  }catch(e){return {name,ok:false,ms:null,detail:String(e).slice(0,60)}}
+}
+(async()=>{
+  const res=await Promise.all(SERVICES.map(probe));
+  const tb=document.getElementById("rows");
+  tb.innerHTML=res.map(r=>`<tr><td>${r.name}</td>
+    <td class="${r.ok?(r.ms>4000?'slow':'ok'):'down'}">${r.ok?(r.ms>4000?'DEGRADED':'UP'):'DOWN'}</td>
+    <td>${r.ms==null?'—':r.ms+'ms'}</td><td>${r.detail}</td></tr>`).join("");
+  document.getElementById("t").textContent=`probed ${res.length} services · ${new Date().toISOString()} (client-side, refresh for latest)`;
+})();
+</script></body></html>

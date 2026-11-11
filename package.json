@@ -1,0 +1,8 @@
+{
+  "name": "settlement-collector",
+  "version": "1.0.0",
+  "description": "RAEN fleet settlement telemetry collector — per-service paid-route events, funnel stats, revenue rollup",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "express": "^5.2.1" }
+}

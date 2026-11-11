@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>RAEN — Public Sales Ledger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="RAEN x402 fleet public sales ledger: total settled USDC, settled transactions, payers, per-service revenue. Straight from the settlement collector's own records.">
+<style>
+:root { color-scheme: dark; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0e14; color:#e6edf3; font-family:ui-sans-serif,system-ui,sans-serif; line-height:1.6; padding:2rem 1rem; }
+main { max-width:860px; margin:0 auto; }
+h1 { font-size:1.9rem; margin:1rem 0 .5rem; }
+h1 span { color:#7ee787; }
+.sub { color:#8b949e; margin-bottom:2rem; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:1rem; margin:1.5rem 0; }
+.card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:1.1rem; }
+.k { color:#8b949e; font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; }
+.v { font-size:1.7rem; font-weight:700; color:#7ee787; margin-top:.3rem; }
+table { width:100%; border-collapse:collapse; margin:1rem 0; font-size:.92rem; }
+th { text-align:left; color:#22d3ee; border-bottom:1px solid #30363d; padding:.5rem .7rem; }
+td { padding:.5rem .7rem; border-bottom:1px solid #21262d; color:#b8c4cf; }
+.note { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:1rem; color:#8b949e; font-size:.9rem; margin-top:1.5rem; }
+a { color:#22d3ee; }
+code { color:#e6edf3; background:#21262d; padding:.1rem .35rem; border-radius:4px; }
+</style></head>
+<body><main>
+<h1>RAEN <span>Public Sales Ledger</span></h1>
+<p class="sub">Every settled USDC payment across the RAEN x402 fleet, aggregated from the settlement collector's own event records. No restatement, no estimates outside the data.</p>
+<div class="grid">
+<div class="card"><div class="k">Total settled (USDC)</div><div class="v" id="l-total">–</div></div>
+<div class="card"><div class="k">Settled transactions</div><div class="v" id="l-count">–</div></div>
+<div class="card"><div class="k">Distinct payers</div><div class="v" id="l-payers">–</div></div>
+</div>
+<h2 style="color:#22d3ee;font-size:1.2rem;margin:1.5rem 0 .5rem">Per-service breakdown</h2>
+<table><thead><tr><th>Service</th><th>Settled txs</th><th>Settled (USDC)</th></tr></thead>
+<tbody id="svc-rows"><tr><td colspan="3">loading…</td></tr></tbody></table>
+<p style="color:#8b949e;font-size:.85rem" id="l-updated"></p>
+<div class="note">
+Machine-readable JSON: <a href="/ledger"><code>GET /ledger</code></a> · raw settled events: <a href="/events/recent"><code>GET /events/recent</code></a>.
+Balances verifiable on-chain with a single <code>eth_call</code> to any Base RPC against USDC <code>0x8335…2913</code> for payTo <code>0x9b8a…f72f</code>.
+<br><br><a href="/proof">Proof of Commerce</a> · <a href="/">Fleet status</a> · <a href="https://raen.royalruby.io">Catalog</a>
+</div>
+</main>
+<script>
+fetch('/ledger').then(r=>r.json()).then(d=>{
+  document.getElementById('l-total').textContent = '$' + (d.total_settled_usdc ?? 0);
+  document.getElementById('l-count').textContent = d.settled_tx_count ?? 0;
+  document.getElementById('l-payers').textContent = d.distinct_payers ?? 0;
+  if (d.last_updated) document.getElementById('l-updated').textContent =
+    'Last updated: ' + new Date(d.last_updated).toISOString() + ' (UTC)';
+  const rows = document.getElementById('svc-rows');
+  rows.innerHTML = '';
+  const svcs = d.per_service || {};
+  const names = Object.keys(svcs);
+  if (!names.length) { rows.innerHTML = '<tr><td colspan="3">no settled transactions yet</td></tr>'; return; }
+  for (const name of names) {
+    const s = svcs[name];
+    rows.innerHTML += `<tr><td>${name}</td><td>${s.settled_tx_count}</td><td>$${s.settled_usdc}</td></tr>`;
+  }
+}).catch(()=>{ document.getElementById('l-total').textContent='offline'; });
+</script>
+</body></html>
