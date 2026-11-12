@@ -47,6 +47,66 @@ function loadInternalWallets() {
 const internalWallets = loadInternalWallets();
 const isInternalPayer = (p) => Boolean(p) && internalWallets.set.has(String(p).toLowerCase());
 
+// ---- INC-03 payer attribution backfill (Closer, Nov 11): settled events that
+// carry a tx hash but no payer get their on-chain sender resolved via Base RPC
+// eth_getTransactionReceipt and cached on the volume, so the ledger's
+// distinct_external_payers reflects reality instead of permanent "unattributed".
+// Unresolvable txs (simulated probes / pruned receipts) cache as "unknown" and
+// stay unattributed — never counted as external revenue (TRUTH law). ----
+const PAYER_CACHE_FILE = path.join("/data", "payer-cache.json").replace(/\//g, require("path").sep);
+let payerCache = {};
+try { payerCache = JSON.parse(fs.readFileSync(PAYER_CACHE_FILE, "utf8")) || {}; } catch {}
+function persistPayerCache() {
+  try {
+    fs.mkdirSync(path.dirname(PAYER_CACHE_FILE), { recursive: true });
+    fs.writeFileSync(PAYER_CACHE_FILE, JSON.stringify(payerCache));
+  } catch (e) { console.error("payer-cache persist failed:", e.message); }
+}
+const BASE_RPCS = (process.env.BASE_RPCS || "https://mainnet.base.org,https://base.llamarpc.com,https://1rpc.io/base").split(",").map(s => s.trim());
+async function txSender(txHash) {
+  for (const rpc of BASE_RPCS) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 8000);
+      const r = await fetch(rpc, {
+        method: "POST", headers: { "content-type": "application/json" }, signal: ctl.signal,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getTransactionReceipt", params: [txHash] }),
+      });
+      clearTimeout(t);
+      const j = await r.json();
+      const from = j && j.result && j.result.from;
+      if (from) return String(from).toLowerCase();
+    } catch (e) { /* try next RPC */ }
+  }
+  return null;
+}
+let payerBackfillRunning = false;
+async function backfillPayers() {
+  if (payerBackfillRunning) return;
+  const targets = events.filter(e => e.event === "settled" && e.tx && !e.payer && payerCache[e.tx] === undefined);
+  if (!targets.length) return;
+  payerBackfillRunning = true;
+  try {
+    const BATCH = 8;
+    for (let i = 0; i < targets.length; i += BATCH) {
+      await Promise.all(targets.slice(i, i + BATCH).map(async (e) => {
+        const from = await txSender(e.tx);
+        payerCache[e.tx] = from || "unknown";
+        if (from) e.payer = from;
+      }));
+    }
+    persistPayerCache();
+    console.log("payer backfill:", Object.keys(payerCache).length, "txs cached");
+  } catch (e) { console.error("payer backfill error:", e.message); }
+  finally { payerBackfillRunning = false; }
+}
+// apply cached senders to restored events so restarts keep attribution
+function applyPayerCache() {
+  for (const e of events) {
+    if (e.event === "settled" && e.tx && !e.payer && payerCache[e.tx] && payerCache[e.tx] !== "unknown") e.payer = payerCache[e.tx];
+  }
+}
+
 app.get("/ledger.json", (_req, res) => {
   const settled = events.filter(e => e.event === "settled");
   const perService = {};
@@ -110,6 +170,7 @@ try {
       .filter(Boolean);
   }
 } catch (e) { console.error("restore failed:", e.message); }
+applyPayerCache();
 
 let flushTimer = null;
 function persist(ev) {
@@ -234,4 +295,6 @@ app.get("/report/cron", async (req, res) => {
 
 app.get("/events/recent", (_req, res) => res.json(events.slice(-200).reverse()));
 
+setInterval(backfillPayers, 300000).unref();
+backfillPayers();
 app.listen(PORT, () => console.log(`settlement-collector on ${PORT}, ${events.length} events restored`));
