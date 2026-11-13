@@ -1,62 +1,10 @@
 <!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>RAEN — Proof of Commerce</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="Live payment telemetry for the RAEN x402 fleet. Every number on this page is fetched from a public API and verifiable on-chain.">
-<style>
-:root { color-scheme: dark; }
-* { margin:0; padding:0; box-sizing:border-box; }
-body { background:#0a0e14; color:#e6edf3; font-family:ui-sans-serif,system-ui,sans-serif; line-height:1.6; padding:2rem 1rem; }
-main { max-width:860px; margin:0 auto; }
-h1 { font-size:1.9rem; margin:1rem 0 .5rem; }
-h1 span { color:#22d3ee; }
-.sub { color:#8b949e; margin-bottom:2rem; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:1rem; margin:1.5rem 0; }
-.card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:1.1rem; }
-.k { color:#8b949e; font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; }
-.v { font-size:1.7rem; font-weight:700; color:#7ee787; margin-top:.3rem; }
-.v.warn { color:#f0b72f; }
-table { width:100%; border-collapse:collapse; margin:1rem 0; font-size:.92rem; }
-th { text-align:left; color:#22d3ee; border-bottom:1px solid #30363d; padding:.5rem .7rem; }
-td { padding:.5rem .7rem; border-bottom:1px solid #21262d; color:#b8c4cf; }
-.note { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:1rem; color:#8b949e; font-size:.9rem; margin-top:1.5rem; }
-a { color:#22d3ee; }
-</style></head>
-<body><main>
-<h1>RAEN <span>Proof of Commerce</span></h1>
-<p class="sub">Live payment telemetry from the RAEN x402 fleet on Base mainnet. Every number below is fetched from a public endpoint and checkable on-chain. Zero marketing overlay.</p>
-<div class="grid">
-<div class="card"><div class="k">Challenges (24h)</div><div class="v" id="c-chal">–</div></div>
-<div class="card"><div class="k">Settled (24h)</div><div class="v" id="c-set">–</div></div>
-<div class="card"><div class="k">Failed (24h)</div><div class="v warn" id="c-fail">–</div></div>
-<div class="card"><div class="k">Revenue (24h)</div><div class="v" id="c-rev">–</div></div>
-</div>
-<h2 style="color:#22d3ee;font-size:1.2rem;margin:1.5rem 0 .5rem">Per-service funnels</h2>
-<table><thead><tr><th>Service</th><th>Challenges</th><th>Settled</th><th>Failed</th><th>Revenue</th></tr></thead>
-<tbody id="svc-rows"><tr><td colspan="5">loading…</td></tr></tbody></table>
-<div class="note">
-<strong>Why this page exists.</strong> A payments company that won't show its ledger is selling a story.
-This page is the ledger. The challenge/settle counts come from the fleet's own settlement collector;
-the balances can be verified with a single <code>eth_call</code> to any Base RPC against USDC
-<code>0x8335…2913</code> for payTo <code>0x9b8a…f72f</code>.
-<br><br>First external settlement pending — the counters are real and update as buyers arrive.
-<a href="/ledger">Sales ledger</a> · <a href="/">Fleet status</a> · <a href="https://raen.royalruby.io">Catalog</a>
-</div>
-</main>
-<script>
-fetch('https://settlement-collector.fly.dev/stats').then(r=>r.json()).then(d=>{
-  const f = d.fleet_24h || {};
-  document.getElementById('c-chal').textContent = f.challenges ?? '–';
-  document.getElementById('c-set').textContent = f.settled ?? '–';
-  document.getElementById('c-fail').textContent = f.failed ?? '–';
-  document.getElementById('c-rev').textContent = '$' + (f.revenue_usd ?? 0);
-  const rows = document.getElementById('svc-rows');
-  rows.innerHTML = '';
-  const svcs = d.services || {};
-  for (const [name, s] of Object.entries(svcs)) {
-    const h = s['24h'] || s.all || {};
-    rows.innerHTML += `<tr><td>${name}</td><td>${h.challenges ?? 0}</td><td>${h.settled ?? 0}</td><td>${h.failed ?? 0}</td><td>$${h.revenue_usd ?? 0}</td></tr>`;
-  }
-}).catch(()=>{ document.getElementById('c-chal').textContent='offline'; });
-</script>
-</body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Error</title>
+</head>
+<body>
+<pre>Cannot GET /proof.html</pre>
+</body>
+</html>
