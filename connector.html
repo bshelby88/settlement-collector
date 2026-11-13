@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAEN Connector Program — white-label dispute letters, 20% lifetime</title>
+<style>
+  body{font-family:Georgia,serif;background:#0d1117;color:#e6edf3;max-width:720px;margin:0 auto;padding:2rem 1.25rem;line-height:1.55}
+  h1{font-size:1.6rem;color:#58a6ff} h2{font-size:1.15rem;color:#79c0ff;margin-top:1.8rem}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1.25rem;margin:1.2rem 0}
+  li{margin:.35rem 0} code{background:#21262d;padding:.1rem .35rem;border-radius:4px}
+  input{width:100%;box-sizing:border-box;padding:.55rem;margin:.3rem 0;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-size:.95rem}
+  button{background:#238636;color:#fff;border:none;padding:.6rem 1.3rem;border-radius:6px;font-size:1rem;cursor:pointer;margin-top:.5rem}
+  .fine{color:#8b949e;font-size:.85rem}
+</style>
+</head>
+<body>
+<h1>Earn 20% lifetime on letters your people already need</h1>
+<p>You coach, teach, or sell to credit-repair business owners. Every one of them generates dispute
+letters by hand or pays a SaaS for the privilege. RAEN's dispute-letter engine does the drafting:
+<strong>$0.75 per letter, $0.05 per statutory citation</strong>, paid per call, no minimums, no contract.</p>
+
+<div class="card">
+<h2>Connector terms</h2>
+<ul>
+  <li><strong>20% lifetime commission</strong> on every settled call your referrals make</li>
+  <li><strong>First 10 letters free</strong> — for you or for a client you choose</li>
+  <li>White-label: the letters go out under <em>your</em> brand, not ours</li>
+  <li>No minimums, no monthly fee, no contract — pay per letter</li>
+  <li>Settled in USDC on Base; your commission tracked on the public ledger</li>
+</ul>
+</div>
+
+<h2>Claim your connector link</h2>
+<form id="signup">
+  <input name="name" placeholder="Your name" required>
+  <input name="org" placeholder="Organization / channel (optional)">
+  <input name="email" type="email" placeholder="Email" required>
+  <input name="audience" placeholder="Who's in your audience (coaches, CROs, SaaS users…)">
+  <button type="submit">Get my connector terms</button>
+  <div class="fine" id="msg" style="margin-top:.5rem"></div>
+</form>
+
+<p class="fine">B2B only — document preparation for business software and service providers; not a
+credit-repair service and no consumer credit promises. FCRA-compliant posture: we prepare drafts,
+professionals review before use. Questions: <a style="color:#58a6ff" href="mailto:ops@royalruby.io">ops@royalruby.io</a>.</p>
+
+<script>
+document.getElementById('signup').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target, msg = document.getElementById('msg');
+  const body = Object.fromEntries(new FormData(f).entries());
+  try {
+    const r = await fetch('/connector-signup', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if (r.ok) { f.style.display='none'; msg.textContent='You are in. Watch your inbox for connector terms and your tracked link — first 10 letters are free.'; }
+    else { msg.textContent='Something went wrong (' + r.status + '). Email ops@royalruby.io and we will set you up manually.'; }
+  } catch { msg.textContent='Network error — email ops@royalruby.io and we will set you up manually.'; }
+});
+</script>
+</body>
+</html>

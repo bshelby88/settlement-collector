@@ -365,4 +365,29 @@ app.get("/fleet.json", async (_req, res) => {
 // ---- fully-autonomous USDC storefront (Bean, Nov 11) ----
 wireStorefront(app, { isInternalPayer });
 
+// Connector program: terms page + signup capture (JUANTERRY, Nov 2026).
+// Signups append-only on the volume; page is public, capture is write-only.
+const CONNECTOR_FILE = path.join("/data", "connector-signups.jsonl").replace(/\//g, path.sep);
+app.get("/connector", (_req, res) => res.sendFile(path.join(__dirname, "connector.html")));
+app.post("/connector-signup", (req, res) => {
+  const { name, org, email, audience } = req.body || {};
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !name) {
+    return res.status(400).json({ ok: false, error: "name and valid email required" });
+  }
+  const rec = {
+    ts: Date.now(),
+    name: String(name).slice(0, 120),
+    org: String(org || "").slice(0, 200),
+    email: String(email).slice(0, 200),
+    audience: String(audience || "").slice(0, 300),
+  };
+  try {
+    fs.mkdirSync(path.dirname(CONNECTOR_FILE), { recursive: true });
+    fs.appendFileSync(CONNECTOR_FILE, JSON.stringify(rec) + "\n");
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "could not persist signup" });
+  }
+  res.json({ ok: true, next: "connector terms + tracked link sent within one business day" });
+});
+
 app.listen(PORT, () => console.log(`settlement-collector on ${PORT}, ${events.length} events restored`));
