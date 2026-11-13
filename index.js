@@ -244,6 +244,31 @@ app.get("/report/cron", async (req, res) => {
   res.json({ ok: true, sent: results });
 });
 
+// ---- page-hit telemetry (ARC-48): one-line beacon endpoint ----
+const HIT_LOG = path.join("/data", "hit-log.jsonl");
+app.get("/hit", (req, res) => {
+  try {
+    const row = {
+      ts: new Date().toISOString(),
+      src: String(req.query.src || "unknown").slice(0, 80),
+      ref: String(req.get("referer") || "").slice(0, 300),
+      ua: String(req.get("user-agent") || "").slice(0, 200),
+    };
+    fs.appendFileSync(HIT_LOG, JSON.stringify(row) + "\n");
+  } catch (_e) { /* never fail the beacon */ }
+  res.set("Cache-Control", "no-store, max-age=0");
+  res.set("Access-Control-Allow-Origin", "*");
+  res.type("gif").send(Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"));
+});
+app.get("/hits.json", (_req, res) => {
+  try {
+    const lines = fs.existsSync(HIT_LOG) ? fs.readFileSync(HIT_LOG, "utf8").trim().split("\n").filter(Boolean) : [];
+    const rows = lines.map((l) => { try { return JSON.parse(l); } catch (_e) { return null; } }).filter(Boolean);
+    const bySrc = {};
+    for (const r of rows) bySrc[r.src] = (bySrc[r.src] || 0) + 1;
+    res.json({ ok: true, total: rows.length, by_src: bySrc, last: rows.slice(-20).reverse() });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
 app.get("/events/recent", (_req, res) => res.json(events.slice(-200).reverse()));
 
 // ---- THE TRANSPARENT COMPANY — live page + agent action feed (Bean, Nov 12) ----
