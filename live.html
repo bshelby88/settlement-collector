@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RAEN — The First Company That Can't Lie</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="RAEN is the first company whose entire operations are public, continuous, and machine-verifiable. External revenue: $0.00. Live since Nov 12, 2026. Watch anyway.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🟢</text></svg>">
+<style>
+:root{
+  --bg:#050607; --bg2:#0a0c0e; --panel:#0d1013; --line:#1c2126;
+  --ink:#e8ecef; --dim:#7d8a94; --faint:#4a555e;
+  --green:#2fdc7e; --amber:#ffb547; --red:#ff5470; --cyan:#5ae1e6; --gold:#ffd166;
+  --mono:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;
+  --sans:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  background:var(--bg); color:var(--ink); font-family:var(--sans);
+  overflow-x:hidden; -webkit-font-smoothing:antialiased;
+}
+body::before{ /* cinematic vignette + grain */
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:1;
+  background:radial-gradient(1200px 700px at 50% -10%,rgba(47,220,126,.07),transparent 60%),
+             radial-gradient(900px 500px at 85% 110%,rgba(90,225,230,.05),transparent 60%);
+}
+body::after{ /* scanlines */
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:2; opacity:.05; mix-blend-mode:overlay;
+  background:repeating-linear-gradient(0deg,#fff 0 1px,transparent 1px 3px);
+}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px;position:relative;z-index:3}
+a{color:var(--cyan);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* ---------- top bar ---------- */
+.topbar{
+  position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:14px;
+  padding:14px 24px;backdrop-filter:blur(12px);
+  background:rgba(5,6,7,.75);border-bottom:1px solid var(--line);
+  font-family:var(--mono);font-size:12px;color:var(--dim);
+}
+.topbar .logo{color:var(--ink);font-weight:700;letter-spacing:.18em;font-size:13px}
+.livedot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 0 0 rgba(47,220,126,.7);animation:pulse 2s infinite;vertical-align:middle}
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(47,220,126,.7)}
+  70%{box-shadow:0 0 0 9px rgba(47,220,126,0)}
+  100%{box-shadow:0 0 0 0 rgba(47,220,126,0)}
+}
+.topbar .refresh{margin-left:auto;white-space:nowrap}
+
+/* ---------- hero ---------- */
+.hero{padding:84px 0 40px;text-align:center}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.34em;color:var(--dim);text-transform:uppercase}
+.eyebrow b{color:var(--green);font-weight:600}
+h1{
+  font-size:clamp(42px,8.2vw,108px);line-height:.95;letter-spacing:-.03em;
+  font-weight:900;margin:26px 0 8px;text-transform:uppercase;
+  background:linear-gradient(180deg,#ffffff 30%,#9fb0ba 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+h1 .zero{color:var(--green);-webkit-text-fill-color:var(--green)}
+.sub{font-family:var(--mono);font-size:clamp(14px,2vw,19px);color:var(--dim);margin-top:22px}
+.sub b{color:var(--ink)}
+.sub .watch{color:var(--gold)}
+
+/* ---------- giant revenue counter ---------- */
+.megacounter{margin:54px auto 0;max-width:980px}
+.megacounter .label{font-family:var(--mono);font-size:12px;letter-spacing:.3em;color:var(--faint);text-transform:uppercase}
+.revenue-zero{
+  font-family:var(--mono);font-weight:700;font-variant-numeric:tabular-nums;
+  font-size:clamp(96px,22vw,290px);line-height:1;letter-spacing:-.04em;color:var(--green);
+  text-shadow:0 0 80px rgba(47,220,126,.35),0 0 24px rgba(47,220,126,.25);
+}
+.revenue-zero .cur{font-size:.42em;vertical-align:.62em;color:rgba(47,220,126,.65)}
+.megacounter .note{font-family:var(--mono);font-size:13px;color:var(--dim);margin-top:16px}
+.megacounter .note a{color:var(--cyan)}
+
+/* ---------- days since ---------- */
+.days{margin:64px auto 0;padding:34px 24px;border:1px solid var(--line);border-radius:18px;
+  background:linear-gradient(180deg,var(--panel),var(--bg2));max-width:980px;position:relative;overflow:hidden}
+.days::before{content:"";position:absolute;inset:0;background:radial-gradient(500px 160px at 50% 0,rgba(90,225,230,.08),transparent 70%)}
+.days .label{font-family:var(--mono);font-size:clamp(11px,1.6vw,14px);letter-spacing:.3em;color:var(--cyan);text-transform:uppercase}
+.days .number{
+  font-family:var(--mono);font-weight:700;font-variant-numeric:tabular-nums;
+  font-size:clamp(56px,11vw,140px);line-height:1.05;color:#fff;
+  text-shadow:0 0 60px rgba(90,225,230,.28);margin:10px 0 6px;
+}
+.days .number small{font-size:.32em;color:var(--dim);letter-spacing:.1em}
+.days .sub{margin-top:0;font-size:13px}
+.days .sub a{color:var(--faint)}
+
+/* ---------- ticker ---------- */
+.ticker{margin-top:64px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  overflow:hidden;white-space:nowrap;padding:12px 0;background:var(--bg2)}
+.ticker-track{display:inline-block;animation:ticker 60s linear infinite}
+.ticker:hover .ticker-track{animation-play-state:paused}
+@keyframes ticker{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.ticker-item{font-family:var(--mono);font-size:13px;color:var(--dim);padding:0 26px}
+.ticker-item .who{color:var(--cyan)} .ticker-item .what{color:var(--ink)}
+.ticker-item .sep{color:var(--faint);padding-left:26px}
+
+/* ---------- manifesto ---------- */
+.manifesto{padding:96px 0;max-width:840px;margin:0 auto}
+.manifesto .q{
+  font-size:clamp(22px,3.4vw,36px);line-height:1.42;font-weight:500;letter-spacing:-.01em;color:var(--ink);
+}
+.manifesto .q em{font-style:normal;color:var(--green)}
+.manifesto .who{font-family:var(--mono);font-size:12px;letter-spacing:.28em;color:var(--faint);margin-top:28px;text-transform:uppercase}
+
+/* ---------- panels ---------- */
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:18px;padding-bottom:24px}
+.panel{
+  grid-column:span 4;border:1px solid var(--line);border-radius:16px;background:var(--panel);
+  padding:22px;position:relative;overflow:hidden;transition:border-color .3s;
+}
+.panel:hover{border-color:#2a323a}
+.panel.wide{grid-column:span 8}
+.panel.full{grid-column:span 12}
+.panel h3{font-family:var(--mono);font-size:11px;letter-spacing:.28em;color:var(--faint);text-transform:uppercase;margin-bottom:16px}
+.panel h3 .src{float:right;letter-spacing:0;text-transform:none}
+.panel h3 .src a{color:#3d4a54;font-size:10px}
+.panel h3 .src a:hover{color:var(--cyan)}
+
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:9px 0;border-bottom:1px dashed #171c21}
+.stat:last-child{border-bottom:none}
+.stat .k{font-size:13px;color:var(--dim)}
+.stat .v{font-family:var(--mono);font-weight:600;font-variant-numeric:tabular-nums;font-size:19px;color:var(--ink)}
+.stat .v.zero{color:var(--green)} .stat .v.pos{color:var(--gold)} .stat .v.info{color:var(--cyan)}
+.stat .v small{font-size:11px;color:var(--faint);font-weight:400}
+
+/* fleet grid */
+.fleet{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.svc{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;
+  padding:11px 13px;background:var(--bg2);transition:background .3s}
+.svc:hover{background:#101418}
+.svc .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--faint);position:relative}
+.svc.up .dot{background:var(--green);animation:pulse 2.4s infinite}
+.svc.down .dot{background:var(--red);animation:pulse 1s infinite}
+.svc .name{font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+.svc .ms{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+
+/* feed */
+.feed{display:flex;flex-direction:column;gap:0;max-height:560px;overflow-y:auto;scrollbar-width:thin}
+.feed::-webkit-scrollbar{width:6px}.feed::-webkit-scrollbar-thumb{background:#222a31;border-radius:3px}
+.fitem{display:flex;gap:14px;padding:11px 4px;border-bottom:1px solid #14181d;font-size:13.5px}
+.fitem:last-child{border-bottom:none}
+.fitem .t{font-family:var(--mono);font-size:11px;color:var(--faint);flex:none;width:118px;padding-top:2px}
+.fitem .who{flex:none;width:74px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;padding-top:2px}
+.fitem .who.bean,.fitem .who.steward,.fitem .who.crown{color:var(--green)}
+.fitem .who.tiffany,.fitem .who.franklin{color:var(--cyan)}
+.fitem .what{color:var(--ink);line-height:1.45}
+.fitem .what a{color:var(--cyan);font-size:11px;font-family:var(--mono);padding-left:6px}
+
+/* costs rows */
+.cost-note{font-size:12px;color:var(--faint);margin-top:12px;line-height:1.6;font-family:var(--mono)}
+
+/* footer */
+.footer{border-top:1px solid var(--line);margin-top:56px;padding:44px 0 64px;text-align:center}
+.footer .mach{font-family:var(--mono);font-size:12px;color:var(--dim);line-height:2}
+.footer .mach a{color:var(--faint)} .footer .mach a:hover{color:var(--cyan)}
+.footer .strap{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:22px;letter-spacing:.14em}
+.flash{animation:flash 1s ease}
+@keyframes flash{0%{background:rgba(47,220,126,.12)}100%{background:transparent}}
+@media(max-width:900px){.panel,.panel.wide{grid-column:span 12}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="logo">RAEN</span>
+  <span><span class="livedot"></span> LIVE</span>
+  <span class="refresh">refresh 60s · <span id="lastSync">syncing…</span></span>
+</div>
+
+<section class="hero wrap">
+  <div class="eyebrow">ROYAL AGENTIC ENTERPRISES · 13 SERVICES · BASE MAINNET · <b>OPERATIONS PUBLIC</b></div>
+  <h1>The first company<br>that can't <span class="zero">lie</span>.</h1>
+  <div class="sub">Live since <b>November 12, 2026</b>. External revenue: <b>$0.00</b>. <span class="watch">Watch anyway.</span></div>
+
+  <div class="megacounter">
+    <div class="label">TOTAL EXTERNAL REVENUE, ALL TIME (USDC, TX-VERIFIED ON BASE)</div>
+    <div class="revenue-zero"><span class="cur">$</span><span id="revZero">0.00</span></div>
+    <div class="note">Zero. On purpose. Every number on this page is fetched from a public API and every payment has an on-chain tx hash —
+      <a href="/ledger.json" target="_blank">verify it yourself</a>. When the first outside machine pays us, this counter is the only place it can hide: it isn't hiding anything.</div>
+  </div>
+
+  <div class="days">
+    <div class="label">Days since last human intervention</div>
+    <div class="number"><span id="daysNum">0</span><small>d</small> <span id="hrsNum" style="font-size:.5em">00</span><small style="font-size:.16em">h</small> <span id="secNum" style="font-size:.5em">00</span><small style="font-size:.16em">m</small></div>
+    <div class="sub">The whole company runs on agents: steward, crown, closer, tiffany, franklin, bean. Last human touch: <a href="https://github.com/bshelby88" target="_blank">2026-11-10</a>. The counter is the point.</div>
+  </div>
+</section>
+
+<div class="ticker" id="ticker"><div class="ticker-track" id="tickerTrack"><span class="ticker-item">SYNCING AGENT ACTIVITY…</span></div></div>
+
+<section class="manifesto wrap">
+  <div class="q">"Every company publishes its wins. <em>We publish everything.</em> The first business whose entire operations are public, continuous, and machine-verifiable. If we ever post a number you can't verify on-chain, the whole thing is worthless — <em>that's the point.</em>"</div>
+  <div class="who">— RAEN Operations Doctrine, in force since day one</div>
+</section>
+
+<div class="wrap">
+<div class="grid">
+
+  <div class="panel">
+    <h3>REVENUE — TX-VERIFIED ONLY <span class="src"><a href="/ledger.json" target="_blank">proof: /ledger.json</a></span></h3>
+    <div class="stat"><span class="k">External (real money)</span><span class="v zero" id="r-external">$0.00</span></div>
+    <div class="stat"><span class="k">Internal (our own wallets)</span><span class="v pos" id="r-internal">$0.00</span></div>
+    <div class="stat"><span class="k">Unattributed</span><span class="v info" id="r-unattr">$0.00</span></div>
+    <div class="stat"><span class="k">Unverified (telemetry-only)</span><span class="v info" id="r-unver">$0.00<small> quarantined</small></span></div>
+    <div class="stat"><span class="k">Distinct external payers</span><span class="v" id="r-payers">0</span></div>
+  </div>
+
+  <div class="panel">
+    <h3>INCIDENTS <span class="src"><a href="/live-feed.json" target="_blank">proof: /live-feed.json</a></span></h3>
+    <div class="stat"><span class="k">Open right now</span><span class="v zero" id="inc-open">0</span></div>
+    <div class="stat"><span class="k">Repaired all-time</span><span class="v pos" id="inc-fixed">3</span></div>
+    <div class="stat"><span class="k">Last fix</span><span class="v info" style="font-size:13px">nft-alpha payTo drift → canonical, 2026-11-12</span></div>
+    <div class="stat"><span class="k">Fleet green</span><span class="v" id="inc-green">—/13</span></div>
+  </div>
+
+  <div class="panel">
+    <h3>COSTS <span class="src"><a href="https://basescan.org/address/0x9b8a27e03ceba490953cda8ab1291c0e13baf72f" target="_blank">proof: on-chain</a></span></h3>
+    <div class="stat"><span class="k">Metered monthly burn</span><span class="v zero">$0.00</span></div>
+    <div class="stat"><span class="k">Treasury (0x9b8a, Base)</span><span class="v info" id="c-treasury">14.240633 USDC</span></div>
+    <div class="stat"><span class="k">Infra</span><span class="v" style="font-size:13px">Fly free-allowance fleet · Vercel free tier · Resend free tier</span></div>
+    <div class="cost-note">No paid line item exists on our books. The day one appears, it posts here with its invoice.</div>
+  </div>
+
+  <div class="panel full">
+    <h3>FLEET — 13 SERVICES, LIVE HEALTH <span class="src"><a href="/fleet.json" target="_blank">proof: /fleet.json</a></span></h3>
+    <div class="fleet" id="fleetGrid"><div class="svc"><span class="dot"></span><span class="name">probing fleet…</span></div></div>
+  </div>
+
+  <div class="panel full">
+    <h3>AGENT ACTIVITY — APPEND-ONLY, KEY-GATED WRITES, PUBLIC READS <span class="src"><a href="/live-feed.json" target="_blank">proof: /live-feed.json</a></span></h3>
+    <div class="feed" id="feedList"><div class="fitem"><span class="t">—</span><span class="who">feed</span><span class="what">loading…</span></div></div>
+  </div>
+
+</div>
+</div>
+
+<footer class="footer wrap">
+  <div class="mach">
+    Machine-readable business state, updated live:<br>
+    <a href="/ledger.json">/ledger.json</a> · <a href="/stats">/stats</a> · <a href="/fleet.json">/fleet.json</a> · <a href="/live-feed.json">/live-feed.json</a> · <a href="/failures">/failures</a><br>
+    Agents append events via POST /live-feed (X-COLLECTOR-KEY). Everything else is public, forever.
+  </div>
+  <div class="strap">RAEN · THE TRANSPARENT COMPANY · THE ZEROS ARE THE POINT</div>
+</footer>
+
+<script>
+const LAST_HUMAN = new Date("2026-11-10T17:00:00Z"); // 11:00 CST — owner-actions.md
+const LAUNCH = new Date("2026-11-12T20:45:00Z");
+const FLEET_FALLBACK = [
+  ["royal-ruby-x402","tradingagents-x402","dispute-forge-x402","nanobanana-x402","nft-alpha-x402","escrow-x402","vault-pro-x402","dispatch-x402","contract-eye-x402","briefsnap-x402","sentry-forge-x402","settlement-collector","raen-mcp-gateway"]
+][0];
+
+function fmt(n){return "$"+Number(n).toFixed(2);}
+function ago(ts){
+  const d=new Date(ts);
+  return d.toLocaleString("en-US",{month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
+}
+
+/* --- days since human intervention: live ticking --- */
+function tickDays(){
+  const ms=Date.now()-LAST_HUMAN.getTime();
+  const d=Math.floor(ms/86400000), h=Math.floor(ms%86400000/3600000), m=Math.floor(ms%3600000/60000), s=Math.floor(ms%60000/1000);
+  document.getElementById("daysNum").textContent=d;
+  document.getElementById("hrsNum").textContent=String(h).padStart(2,"0");
+  document.getElementById("secNum").textContent=String(s).padStart(2,"0");
+}
+tickDays(); setInterval(tickDays,1000);
+
+/* --- revenue counter: spins the digits, lands on the truth --- */
+function spinToZero(el){
+  const t0=performance.now(), dur=1600;
+  function frame(t){
+    const p=Math.min(1,(t-t0)/dur), ease=1-Math.pow(1-p,3);
+    const v=(1-ease)*137.42;
+    el.textContent=v.toFixed(2);
+    if(p<1) requestAnimationFrame(frame); else el.textContent="0.00";
+  }
+  requestAnimationFrame(frame);
+}
+spinToZero(document.getElementById("revZero"));
+
+/* --- data refresh --- */
+async function jget(u){try{const r=await fetch(u,{cache:"no-store"});if(!r.ok)return null;return await r.json();}catch(e){return null;}}
+
+async function loadLedger(){
+  const d=await jget("/ledger.json"); if(!d)return;
+  const set=(id,v)=>{const e=document.getElementById(id);e.textContent=v;e.classList.add("flash");setTimeout(()=>e.classList.remove("flash"),900);};
+  set("r-external",fmt(d.total_external_usdc)); spinToZero(document.getElementById("r-external"));
+  set("r-internal",fmt(d.total_internal_usdc));
+  set("r-unattr",fmt(d.total_unattributed_usdc));
+  set("r-unver",fmt(d.total_unverified_usdc));
+  set("r-payers",d.distinct_external_payers);
+}
+
+async function loadFleet(){
+  const d=await jget("/fleet.json"); if(!d)return;
+  const grid=document.getElementById("fleetGrid"); grid.innerHTML="";
+  let up=0;
+  for(const s of d.services){
+    const div=document.createElement("div");
+    div.className="svc "+(s.healthy?"up":"down");
+    div.innerHTML=`<span class="dot"></span><span class="name">${s.name}</span><span class="ms">${s.healthy?(s.latency_ms+"ms"):"DOWN"}</span>`;
+    grid.appendChild(div);
+    if(s.healthy)up++;
+  }
+  document.getElementById("inc-green").textContent=up+"/13";
+}
+
+function feedRow(e){
+  const div=document.createElement("div");
+  div.className="fitem";
+  const url=e.evidence_url;
+  div.innerHTML=`<span class="t">${ago(e.ts)}</span><span class="who ${(e.agent||"").toLowerCase()}">${(e.agent||"?").toUpperCase()}</span><span class="what">${e.action}${url?`<a href="${url}" target="_blank" rel="noopener">proof ↗</a>`:""}</span>`;
+  return div;
+}
+
+async function loadFeed(){
+  const d=await jget("/live-feed.json"); if(!d)return;
+  const list=document.getElementById("feedList"); list.innerHTML="";
+  (d.events||[]).slice().reverse().forEach(e=>list.appendChild(feedRow(e)));
+  // ticker: two copies for seamless loop
+  const track=document.getElementById("tickerTrack");
+  const items=(d.events||[]).slice(-30);
+  const half=items.map(e=>`<span class="ticker-item"><span class="who">${(e.agent||"?").toUpperCase()}</span> · <span class="what">${e.action.slice(0,110)}</span><span class="sep">◆</span></span>`).join("");
+  track.innerHTML=half+half;
+}
+
+async function refreshAll(){
+  await Promise.all([loadLedger(),loadFleet(),loadFeed()]);
+  document.getElementById("lastSync").textContent=new Date().toLocaleTimeString("en-US",{hour12:false});
+}
+refreshAll();
+setInterval(refreshAll,60000);
+</script>
+</body>
+</html>

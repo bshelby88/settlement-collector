@@ -7,6 +7,7 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const { loadConfig, buildReport, renderHtml, sendViaResend } = require("./report");
+const { wireStorefront } = require("./storefront");
 
 const PORT = process.env.PORT || 3000;
 const COLLECTOR_KEY = process.env.COLLECTOR_KEY || "";
@@ -47,98 +48,44 @@ function loadInternalWallets() {
 const internalWallets = loadInternalWallets();
 const isInternalPayer = (p) => Boolean(p) && internalWallets.set.has(String(p).toLowerCase());
 
-// ---- INC-03 payer attribution backfill (Closer, Nov 11): settled events that
-// carry a tx hash but no payer get their on-chain sender resolved via Base RPC
-// eth_getTransactionReceipt and cached on the volume, so the ledger's
-// distinct_external_payers reflects reality instead of permanent "unattributed".
-// Unresolvable txs (simulated probes / pruned receipts) cache as "unknown" and
-// stay unattributed — never counted as external revenue (TRUTH law). ----
-const PAYER_CACHE_FILE = path.join("/data", "payer-cache.json").replace(/\//g, require("path").sep);
-let payerCache = {};
-try { payerCache = JSON.parse(fs.readFileSync(PAYER_CACHE_FILE, "utf8")) || {}; } catch {}
-function persistPayerCache() {
-  try {
-    fs.mkdirSync(path.dirname(PAYER_CACHE_FILE), { recursive: true });
-    fs.writeFileSync(PAYER_CACHE_FILE, JSON.stringify(payerCache));
-  } catch (e) { console.error("payer-cache persist failed:", e.message); }
-}
-const BASE_RPCS = (process.env.BASE_RPCS || "https://mainnet.base.org,https://base.llamarpc.com,https://1rpc.io/base").split(",").map(s => s.trim());
-async function txSender(txHash) {
-  for (const rpc of BASE_RPCS) {
-    try {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), 8000);
-      const r = await fetch(rpc, {
-        method: "POST", headers: { "content-type": "application/json" }, signal: ctl.signal,
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getTransactionReceipt", params: [txHash] }),
-      });
-      clearTimeout(t);
-      const j = await r.json();
-      const from = j && j.result && j.result.from;
-      if (from) return String(from).toLowerCase();
-    } catch (e) { /* try next RPC */ }
-  }
-  return null;
-}
-let payerBackfillRunning = false;
-async function backfillPayers() {
-  if (payerBackfillRunning) return;
-  const targets = events.filter(e => e.event === "settled" && e.tx && !e.payer && payerCache[e.tx] === undefined);
-  if (!targets.length) return;
-  payerBackfillRunning = true;
-  try {
-    const BATCH = 8;
-    for (let i = 0; i < targets.length; i += BATCH) {
-      await Promise.all(targets.slice(i, i + BATCH).map(async (e) => {
-        const from = await txSender(e.tx);
-        payerCache[e.tx] = from || "unknown";
-        if (from) e.payer = from;
-      }));
-    }
-    persistPayerCache();
-    console.log("payer backfill:", Object.keys(payerCache).length, "txs cached");
-  } catch (e) { console.error("payer backfill error:", e.message); }
-  finally { payerBackfillRunning = false; }
-}
-// apply cached senders to restored events so restarts keep attribution
-function applyPayerCache() {
-  for (const e of events) {
-    if (e.event === "settled" && e.tx && !e.payer && payerCache[e.tx] && payerCache[e.tx] !== "unknown") e.payer = payerCache[e.tx];
-  }
-}
-
 app.get("/ledger.json", (_req, res) => {
   const settled = events.filter(e => e.event === "settled");
+  const verified = settled.filter(e => Boolean(e.tx)); // TRUTH (Nov 11): only tx-bearing settles count as revenue
   const perService = {};
   const externalPayers = new Set();
-  let totalExternal = 0, totalInternal = 0, totalUnattributed = 0, internalCount = 0, unattributed = 0;
+  let totalExternal = 0, totalInternal = 0, internalCount = 0, unattributed = 0, totalUnattributed = 0, totalUnverified = 0;
   let lastUpdated = 0;
   const transactions = [];
-  for (const e of settled) {
+  for (const e of verified) {
     const amount = e.price_usd || 0;
     if (e.ts > lastUpdated) lastUpdated = e.ts;
     const internal = isInternalPayer(e.payer);
-    if (!e.payer) unattributed += 1;
+    const attributed = Boolean(e.payer && e.tx);
+    if (!attributed) unattributed += 1;
     if (internal) { totalInternal += amount; internalCount += 1; }
-    else if (!e.payer) { totalUnattributed += amount; } // TRUTH: unattributed is NOT external revenue
-    else {
+    else if (attributed) {
       totalExternal += amount;
       externalPayers.add(e.payer.toLowerCase());
-    }
-    const s = (perService[e.service] ||= { settled_tx_count: 0, settled_usdc: 0, settled_usdc_external: 0, settled_usdc_internal: 0, settled_usdc_unattributed: 0 });
+    } else totalUnattributed += amount;
+    const s = (perService[e.service] ||= { settled_tx_count: 0, settled_usdc: 0, settled_usdc_external: 0, settled_usdc_internal: 0 });
     s.settled_tx_count += 1;
     s.settled_usdc = Math.round((s.settled_usdc + amount) * 10000) / 10000;
     if (internal) s.settled_usdc_internal = Math.round((s.settled_usdc_internal + amount) * 10000) / 10000;
-    else if (!e.payer) s.settled_usdc_unattributed = Math.round((s.settled_usdc_unattributed + amount) * 10000) / 10000;
-    else s.settled_usdc_external = Math.round((s.settled_usdc_external + amount) * 10000) / 10000;
+    else if (attributed) s.settled_usdc_external = Math.round((s.settled_usdc_external + amount) * 10000) / 10000;
+    else s.settled_usdc_unattributed = Math.round(((s.settled_usdc_unattributed || 0) + amount) * 10000) / 10000;
     transactions.push({
       service: e.service, route: e.route, ts: e.ts,
       amount_usd: amount, payer: e.payer || null, tx: e.tx || null,
-      classification: internal ? "internal" : (e.payer ? "external" : "unattributed"),
+      classification: internal ? "internal" : (attributed ? "external" : "unattributed"),
       payer_label: internal
         ? (internalWallets.labels[String(e.payer).toLowerCase()] || "RAEN test")
-        : (e.payer ? "external" : "unattributed"),
+        : (attributed ? "external" : "unattributed"),
     });
+  }
+  // unverified = settled events with no tx hash (telemetry-only, not on-chain money)
+  let unverifiedCount = 0, unverifiedUsd = 0;
+  for (const e of settled) {
+    if (!e.tx) { unverifiedCount += 1; unverifiedUsd += e.price_usd || 0; }
   }
   const r4 = (n) => Math.round(n * 10000) / 10000;
   res.json({
@@ -146,15 +93,15 @@ app.get("/ledger.json", (_req, res) => {
     total_external_usdc: r4(totalExternal),
     total_internal_usdc: r4(totalInternal),
     total_unattributed_usdc: r4(totalUnattributed),
-    settled_tx_count: settled.length,
-    settled_tx_count_external: settled.length - internalCount - unattributed,
+    total_unverified_usdc: r4(unverifiedUsd),
+    settled_tx_count: verified.length,
+    settled_tx_count_unverified: unverifiedCount,
+    settled_tx_count_external: verified.length - internalCount - unattributed,
     settled_tx_count_internal: internalCount,
     settled_tx_count_unattributed: unattributed,
+    note: "Counts include only settlements with an on-chain tx hash (TRUTH law, 2026-11-11).",
     distinct_payers: externalPayers.size,
     distinct_external_payers: externalPayers.size,
-    // TRUTH: total_settled_usdc is the sum of all settled events. External revenue
-    // is ONLY payer-attributed, non-RAEN settlements. Unattributed settlements
-    // (no payer identity) are reported separately and never counted as external.
     per_service: perService,
     transactions: transactions.slice(-500).reverse(),
     last_updated: lastUpdated || null,
@@ -170,7 +117,6 @@ try {
       .filter(Boolean);
   }
 } catch (e) { console.error("restore failed:", e.message); }
-applyPayerCache();
 
 let flushTimer = null;
 function persist(ev) {
@@ -216,14 +162,19 @@ app.get("/stats", (_req, res) => {
     for (const e of list) byEvent[e.event] = (byEvent[e.event] || 0) + 1;
     const settled = byEvent.settled || 0;
     const challenges = byEvent.challenge || 0;
-    const revenue = list.filter(e => e.event === "settled")
+    const verified = list.filter(e => e.event === "settled" && e.tx); // TRUTH: revenue = tx-verified only
+    const revenue = verified.reduce((s, e) => s + (e.price_usd || 0), 0);
+    const unverifiedRevenue = list.filter(e => e.event === "settled" && !e.tx)
       .reduce((s, e) => s + (e.price_usd || 0), 0);
     const lat = list.filter(e => e.event === "settled" && e.latency_ms > 0)
       .map(e => e.latency_ms).sort((a, b) => a - b);
     return {
-      challenges, settled, failed: byEvent.failed || 0, retries: byEvent.retry || 0,
+      challenges, settled, settled_verified: verified.length,
+      settled_unverified: settled - verified.length,
+      failed: byEvent.failed || 0, retries: byEvent.retry || 0,
       convert_pct: challenges + settled ? Math.round(100 * settled / (challenges + settled)) : null,
       revenue_usd: Math.round(revenue * 10000) / 10000,
+      revenue_unverified_usd: Math.round(unverifiedRevenue * 10000) / 10000,
       p50_ms: lat.length ? lat[Math.floor(lat.length / 2)] : null,
       p95_ms: lat.length ? lat[Math.ceil(lat.length * 0.95) - 1] : null,
     };
@@ -295,6 +246,98 @@ app.get("/report/cron", async (req, res) => {
 
 app.get("/events/recent", (_req, res) => res.json(events.slice(-200).reverse()));
 
-setInterval(backfillPayers, 300000).unref();
-backfillPayers();
+// ---- THE TRANSPARENT COMPANY — live page + agent action feed (Bean, Nov 12) ----
+app.get("/live", (_req, res) => res.sendFile(path.join(__dirname, "live.html")));
+
+// Live-feed: append-only JSONL at /data/live-feed.jsonl. All fleet agents
+// (steward/crown/closer/tiffany/franklin/bean) POST one-line events here —
+// key-gated like /events. Boot-seeded from the bundled backfill so the
+// public record starts with the real Nov 10-12 ops history.
+const FEED_FILE = path.join("/data", "live-feed.jsonl").replace(/\//g, require("path").sep);
+const FEED_BACKFILL_FILE = path.join(__dirname, "live-feed-backfill.jsonl");
+const MAX_FEED = 10000;
+let liveFeed = [];
+function loadFeedFrom(file, quiet) {
+  try {
+    if (!fs.existsSync(file)) return 0;
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    let n = 0;
+    for (const l of lines) {
+      try { liveFeed.push(JSON.parse(l)); n++; } catch { /* skip bad line */ }
+    }
+    return n;
+  } catch (e) { if (!quiet) console.error("live-feed load failed:", e.message); return 0; }
+}
+if (fs.existsSync(DATA_FILE)) { // /data volume mounted: restore, else seed from backfill
+  if (fs.existsSync(FEED_FILE)) loadFeedFrom(FEED_FILE, true);
+  if (!liveFeed.length) {
+    const n = loadFeedFrom(FEED_BACKFILL_FILE);
+    if (n) { try { fs.mkdirSync(path.dirname(FEED_FILE), { recursive: true }); fs.copyFileSync(FEED_BACKFILL_FILE, FEED_FILE); } catch (e) { console.error("feed seed copy failed:", e.message); } }
+    console.log(`live-feed seeded with ${n} backfill events`);
+  }
+}
+function feedPersist(ev) {
+  try {
+    fs.mkdirSync(path.dirname(FEED_FILE), { recursive: true });
+    fs.appendFileSync(FEED_FILE, JSON.stringify(ev) + "\n");
+  } catch (e) { /* volume absent - memory-only */ }
+}
+const FEED_AGENTS = new Set(["steward", "crown", "closer", "tiffany", "franklin", "bean", "staci", "hermes", "owner"]);
+
+app.get("/live-feed.json", (req, res) => {
+  const n = Math.min(Number(req.query.limit) || 50, 500);
+  res.json({ total: liveFeed.length, events: liveFeed.slice(-n).reverse() });
+});
+
+app.post("/live-feed", (req, res) => {
+  if (COLLECTOR_KEY && req.get("x-collector-key") !== COLLECTOR_KEY) {
+    return res.status(401).json({ error: "bad collector key" });
+  }
+  const b = req.body || {};
+  const agent = String(b.agent || "").toLowerCase().trim();
+  const action = String(b.action || "").trim();
+  if (!FEED_AGENTS.has(agent)) return res.status(400).json({ error: "agent must be one of " + [...FEED_AGENTS].join(",") });
+  if (!action) return res.status(400).json({ error: "action required" });
+  const ev = {
+    agent,
+    action: action.slice(0, 300),
+    evidence_url: String(b.evidence_url || b.evidenceUrl || "").slice(0, 400),
+    ts: b.ts ? new Date(b.ts).toISOString() : new Date().toISOString(),
+  };
+  liveFeed.push(ev);
+  if (liveFeed.length > MAX_FEED) liveFeed = liveFeed.slice(-MAX_FEED);
+  feedPersist(ev);
+  res.json({ ok: true, total: liveFeed.length });
+});
+
+// Fleet health: server-side probe of all 13 live services, cached 30s.
+const FLEET = [
+  "royal-ruby-x402", "tradingagents-x402", "dispute-forge-x402", "nanobanana-x402",
+  "nft-alpha-x402", "escrow-x402", "vault-pro-x402", "dispatch-x402",
+  "contract-eye-x402", "briefsnap-x402", "sentry-forge-x402", "settlement-collector", "raen-mcp-gateway",
+];
+let fleetCache = { at: 0, data: null };
+async function probeService(name) {
+  const t0 = Date.now();
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 5000);
+    const r = await fetch(`https://${name}.fly.dev/health`, { signal: ctl.signal });
+    clearTimeout(timer);
+    return { name, healthy: r.status === 200, latency_ms: Date.now() - t0 };
+  } catch (e) {
+    return { name, healthy: false, latency_ms: Date.now() - t0 };
+  }
+}
+app.get("/fleet.json", async (_req, res) => {
+  if (fleetCache.data && Date.now() - fleetCache.at < 30000) return res.json(fleetCache.data);
+  const services = await Promise.all(FLEET.map(probeService));
+  const data = { checked_at: new Date().toISOString(), green: services.filter(s => s.healthy).length, total: services.length, services };
+  fleetCache = { at: Date.now(), data };
+  res.json(data);
+});
+
+// ---- fully-autonomous USDC storefront (Bean, Nov 11) ----
+wireStorefront(app, { isInternalPayer });
+
 app.listen(PORT, () => console.log(`settlement-collector on ${PORT}, ${events.length} events restored`));
