@@ -1411,7 +1411,9 @@ function wireStorefront(app, { isInternalPayer }) {
     if (!name) return res.status(400).json({ error: "name required" });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required" });
     let rec = store.findConnectorByEmail(email);
-    if (!rec) {
+    // Hardening (ARC-67): a stale/legacy record without a code must never reach the
+    // buyer-facing email — regenerate instead of rendering "Code: undefined".
+    if (!rec || !rec.code || !store.state.connectors[rec.code]) {
       rec = store.addConnector(name, email, audience);
       log(`connector signed up: ${name} <${email}> -> ${rec.code} (audience: ${audience || "n/a"})`);
     }
