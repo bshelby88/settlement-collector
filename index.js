@@ -6,8 +6,17 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
+const { paymentMiddleware } = require("@x402/express");
+const { x402ResourceServer, HTTPFacilitatorClient } = require("@x402/core/server");
+const { ExactEvmScheme } = require("@x402/evm/exact/server");
+const {
+  CANONICAL_PAY_TO, loadOrCreateSigningKey, canonicalJson, probe,
+  probeManifestAndQuote, buildCertificate, assembleCertificate, isHexAddress,
+} = require("./certify");
 const { loadConfig, buildReport, renderHtml, sendViaResend } = require("./report");
 const { wireStorefront } = require("./storefront");
+const { wireClearing } = require("./clearing");
 
 const PORT = process.env.PORT || 3000;
 const COLLECTOR_KEY = process.env.COLLECTOR_KEY || "";
@@ -362,8 +371,129 @@ app.get("/fleet.json", async (_req, res) => {
   res.json(data);
 });
 
-// ---- fully-autonomous USDC storefront (Bean, Nov 11) ----
-wireStorefront(app, { isInternalPayer });
+// ---- RAEN COMPLIANCE FEED (Bean, Nov 15) — PLAY 1 of EXPERT-REVENUE-ANSWER ----
+// GET /certify/{service} is x402-PAID ($0.01/check): crawlers pay the same way
+// they pay everything else. GET /certify and GET /certify/.well-known/pubkey.pem
+// are FREE discovery surfaces. The certificate reflects REAL state only
+// (TRUTH law): live probes + the collector's own tx-verified ledger.
+const CERTIFY_PRICE = "$0.01"; // ecosystem floor
+const CERTIFY_PAY_TO = process.env.X402_PAY_TO || CANONICAL_PAY_TO;
+if (CERTIFY_PAY_TO.toLowerCase() !== CANONICAL_PAY_TO) {
+  console.error("FATAL: certify payTo must be the canonical RAEN treasury");
+  process.exit(1);
+}
+const CERTIFY_FACILITATOR = process.env.X402_FACILITATOR_URL || "https://raen-facilitator.fly.dev/facilitator";
+const CERTIFY_NETWORK = process.env.X402_NETWORK || "eip155:8453"; // Base mainnet
+const certifyCache = new Map();
+const certSignKeys = loadOrCreateSigningKey();
+
+const certifyRoute = {
+  accepts: {
+    scheme: "exact",
+    price: CERTIFY_PRICE,
+    network: CERTIFY_NETWORK,
+    payTo: CERTIFY_PAY_TO,
+    extra: { facilitator: CERTIFY_FACILITATOR },
+  },
+  serviceName: "raen-compliance-feed",
+  description:
+    "Signed machine-readable compliance certificate for a fleet service: manifest sha256, live 402-quote validity, health probe, last tx-verified settlement evidence, delivery counts, open-claim count. $0.01 per check, Base USDC x402.",
+  mimeType: "application/json",
+};
+const certifyGateRoutes = {
+  "GET /certify/:service": certifyRoute,
+  "* /certify/:service": certifyRoute, // Bazaar validate_endpoint probes GET/HEAD too
+};
+const certifyX402Server = new x402ResourceServer(new HTTPFacilitatorClient({ url: CERTIFY_FACILITATOR }));
+certifyX402Server.register(CERTIFY_NETWORK, new ExactEvmScheme());
+// boot-resilient init (vault-pro pattern): never crash boot on a facilitator blip
+(async () => {
+  for (let i = 1; i <= 12; i++) {
+    try { await certifyX402Server.initialize(); console.log(`→ certify x402 facilitator ready (attempt ${i})`); return; }
+    catch (e) { console.warn(`certify facilitator init attempt ${i}/12 failed: ${e?.message || e}`); await new Promise((r) => setTimeout(r, Math.min(2000 * i, 15000))); }
+  }
+  console.warn("certify facilitator not ready after retries; will init lazily on first paid request");
+})();
+
+const certifyPayment = paymentMiddleware(certifyGateRoutes, certifyX402Server, undefined, undefined, false);
+
+// store the storefront store handle for open-claim counts (wireStorefront returns its store)
+const storefrontStore = wireStorefront(app, { isInternalPayer });
+wireClearing(app, () => events);
+
+// FREE discovery: what this is + how to pay + how to verify signatures
+app.get("/certify", (_req, res) => {
+  res.json({
+    product: "RAEN Compliance Feed",
+    version: "raen-compliance-feed/v1",
+    price: CERTIFY_PRICE,
+    network: CERTIFY_NETWORK,
+    pay_to: CERTIFY_PAY_TO,
+    facilitator: CERTIFY_FACILITATOR,
+    usage: "GET /certify/{service} — send unpaid, decode the 402 PAYMENT-REQUIRED challenge, sign a USDC EIP-3009 transferWithAuthorization, resend with the PAYMENT-SIGNATURE header.",
+    services: FLEET,
+    signature: { algorithm: "Ed25519", public_key: "/certify/.well-known/pubkey.pem", payload: "canonical JSON (sorted keys) of the certificate object minus signature/signing_key_id" },
+    truth_policy: "verdict is derived only from live probe outcomes; settlement/delivery fields come from the collector's own tx-verified ledger. No inflated verdicts.",
+  });
+});
+
+app.get("/certify/.well-known/pubkey.pem", (_req, res) => {
+  res.set("Cache-Control", "public, max-age=300");
+  res.type("text/plain").send(certSignKeys.public_key_pem);
+});
+
+app.get("/certify/.well-known/pubkey.json", (_req, res) => {
+  res.set("Cache-Control", "public, max-age=300");
+  res.json({ algorithm: "Ed25519", public_key_pem: certSignKeys.public_key_pem, key_created_at: certSignKeys.created_at });
+});
+
+// PAID: the certificate itself (challenge/settlement handled by the middleware above)
+app.use(certifyPayment);
+app.get("/certify/:service", async (req, res) => {
+  const svc = String(req.params.service || "").toLowerCase();
+  const names = FLEET;
+  if (!names.includes(svc)) {
+    return res.status(404).json({ ok: false, error: `unknown service '${svc}'`, known_services: names });
+  }
+  const cacheKey = `cert:${svc}`;
+  const cached = certifyCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < Number(process.env.CERTIFY_CACHE_TTL_MS || 30000)) {
+    return res.json(cached.cert);
+  }
+  try {
+    const [health, manifestProbe] = await Promise.all([
+      probe(`https://${svc}.fly.dev/health`),
+      probeManifestAndQuote(svc),
+    ]);
+    const parts = buildCertificate(svc, events, storefrontStore, names);
+    const payload = await assembleCertificate(parts, { health, manifestProbe });
+    const signature = crypto.sign(null, Buffer.from(canonicalJson(payload), "utf8"), certSignKeys.private_key_pem);
+    const cert = { ...payload, signature: signature.toString("base64"), signing_key_id: "settlement-collector-certify-v1", verify: "/certify/.well-known/pubkey.pem" };
+    certifyCache.set(cacheKey, { at: Date.now(), cert });
+    // settle telemetry: this request PAID (the middleware above settled it before
+    // we ran). Extract payer/tx from the PAYMENT-SIGNATURE payload when parseable;
+    // without a parseable tx the event stays tx-less and counts as unverified
+    // revenue per the TRUTH law — never inflate it.
+    try {
+      const payHdr = req.get("payment-signature") || req.get("x-payment");
+      let payer = null, tx = null;
+      if (payHdr) {
+        const p = JSON.parse(Buffer.from(payHdr, "base64").toString("utf8"));
+        payer = (p.from || p.payer || null) || null;
+        tx = p.transaction || p.transactionHash || (p.payload && p.payload.transaction) || null;
+      }
+      const ev = { service: "settlement-collector", event: "settled", route: "/certify/" + svc, price_usd: 0.01, status: 200, error_class: "", latency_ms: 0, tx: tx || "", payer: payer || "", ts: Date.now() };
+      events.push(ev);
+      persist(ev);
+    } catch (e) { /* telemetry must never break delivery */ }
+    res.json(cert);
+  } catch (e) {
+    console.error("certify build failed:", e.message);
+    res.status(500).json({ ok: false, error: "certificate build failed" });
+  }
+});
+
+app.listen(PORT, () => console.log(`settlement-collector on ${PORT}, ${events.length} events restored`));
 
 // Connector program: terms page + signup capture (JUANTERRY, Nov 2026).
 // Signups append-only on the volume; page is public, capture is write-only.
