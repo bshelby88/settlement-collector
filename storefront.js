@@ -10,6 +10,11 @@
 //   POST /storefront/register           — {tx_or_intent, email} binds an email to a tx/payer
 //   GET  /storefront/scan?secret=...    — cron-friendly manual watcher pass
 //
+// Manual-pay recovery (Bean, Nov 15): external transfers matching no catalog
+// price (e.g. a manual EIP-3009 settle with no second X-PAYMENT call) get a
+// claim code + a one-time payment-verified credit confirmation once an email
+// is registered. TRUTH: delivered stays false until a real product ships.
+//
 // Data: /data/storefront.json (volume-mounted, same volume as events.jsonl).
 
 const fs = require("fs");
@@ -74,6 +79,10 @@ const SKILL_CATALOG = {
 for (const [id, p] of Object.entries(SKILL_CATALOG)) CATALOG[id] = p;
 const TOLERANCE_ATOMIC = 10000; // $0.01 in 6-decimal USDC
 const priceToAtomic = (usd) => BigInt(Math.round(usd * 1e6));
+// Manual-pay recovery floor (Bean, Nov 15): external transfers >= $0.01 that
+// match no catalog price get a self-serve claim code instead of silence.
+// Below the floor (e.g. $0.007 scatter dust) is recorded but not claimable.
+const CLAIM_MIN_ATOMIC = 10000n;
 
 // ---------- data store ----------
 function loadState() {
@@ -252,6 +261,14 @@ async function scanOnce(store, isInternalPayer, deliverFn, log = console.log) {
         try { await deliverFn(order, null); } catch (e) {
           console.error("storefront hint delivery failed:", e.message, "tx", tx);
         }
+      } else if (order.classification === "external" && BigInt(amountAtomic) >= CLAIM_MIN_ATOMIC) {
+        // Manual-pay recovery: a real external payment that matches no catalog
+        // price still gets a claim code so its payer can self-serve (register
+        // an email, get a payment-verified credit confirmation). Never silence.
+        log(`storefront: external $${amountUsd} tx ${tx} unmatched to catalog — publishing claim`);
+        try { await deliverFn(order, null); } catch (e) {
+          console.error("storefront claim publish failed:", e.message, "tx", tx);
+        }
       }
     }
     store.state.cursor = to;
@@ -410,6 +427,42 @@ ${d.body}
   });
   if (!r.ok) throw new Error(`resend ${r.status}: ${(await r.text()).slice(0, 200)}`);
   return r.json();
+}
+
+// ---------- manual-pay recovery: payment-verified credit confirmation ----------
+// For external payers whose on-chain transfer matched no catalog price (e.g. a
+// manual EIP-3009 settle without the second X-PAYMENT call). Honest by
+// construction: states exactly what was verified, that nothing was delivered,
+// and the self-serve paths forward. Never promises fulfillment that did not happen.
+function creditEmailHtml(order, claim) {
+  const receipt = `Transaction: ${order.tx}\nBlock: ${order.block}\nPayer: ${order.payer}\nAmount: ${order.amount_usd} USDC\nNetwork: Base mainnet\nClaim code: ${claim}`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment verified — RAEN</title><style>
+body{font-family:Georgia,serif;background:#faf8f4;color:#222;margin:0;padding:1.5rem;line-height:1.5}
+.wrap{max-width:720px;margin:0 auto;background:#fff;border:1px solid #ddd;padding:2rem;border-radius:8px}
+h1{font-size:1.4rem}h1 span{color:#8a1538}
+.receipt{background:#f5efe9;border:1px solid #e5dcd2;border-radius:6px;padding:1rem;font-family:monospace;font-size:.8rem;white-space:pre-wrap}
+code{background:#f0ece6;padding:2px 6px;border-radius:4px}
+.foot{margin-top:1.5rem;font-size:.75rem;color:#999;font-family:system-ui,sans-serif}
+</style></head><body><div class="wrap">
+<h1><span>RAEN</span> — Payment verified</h1>
+<div class="receipt">RECEIPT (on-chain, Base mainnet)
+${esc(receipt)}</div>
+<p>Your USDC payment was verified on-chain. It did not match one of our catalog product prices, so <strong>no product was auto-delivered</strong> — we will not pretend otherwise.</p>
+<p>If you were making a per-call <strong>x402 API request</strong>: a standalone on-chain transfer cannot complete the protocol. The signed payment must ride along as the <code>X-PAYMENT</code> header on your second HTTP request. The 60-second flow: <a href="https://bshelby88.github.io/x402-cookbook/recipes/02-python-client/">cookbook recipe 02</a>. Your call will then settle and return normally.</p>
+<p>Otherwise, your payment is recorded under claim code <code>${esc(claim)}</code>. Reply to this email (ops@royalruby.io) to apply it toward a purchase or a per-call fulfillment, or browse the catalog at <a href="https://settlement-collector.fly.dev/storefront/catalog">/storefront/catalog</a>.</p>
+<div class="foot">Delivered automatically by the RAEN autonomous storefront. Payment verified on-chain before this email was composed. RAEN — managed AI agent operations.</div>
+</div></body></html>`;
+}
+
+async function sendCreditConfirmation(order, email, apiKey) {
+  const claim = order.claim_code || claimCode(order.tx);
+  return sendHtmlEmail(apiKey, {
+    to: email,
+    subject: `RAEN — payment verified ($${order.amount_usd} USDC, claim ${claim})`,
+    html: creditEmailHtml(order, claim),
+    listUnsubscribe: false, // transactional: this thread IS the human contact path
+  });
 }
 
 // ---------- Contract Watch subscriptions ($19/mo, payer-keyed) ----------
@@ -759,6 +812,20 @@ function wireStorefront(app, { isInternalPayer }) {
   const store = makeStore();
   const log = (...a) => console.log("[storefront]", ...a);
 
+  // Manual-pay recovery backfill (Bean, Nov 15): external orders already seen
+  // before this feature get claim codes so their payers can self-serve too.
+  // Dust below the claim floor (scatter transfers) is excluded.
+  let backfilled = 0;
+  for (const o of store.state.orders) {
+    if (o.classification === "external" && !o.delivered && !o.credit_recorded && !o.claim_code &&
+        BigInt(o.amount_atomic || "0") >= CLAIM_MIN_ATOMIC) {
+      o.claim_code = claimCode(o.tx);
+      backfilled++;
+      log(`backfill claim ${o.claim_code} for external tx ${o.tx}`);
+    }
+  }
+  if (backfilled) store.save();
+
   // Resolve product for an order: explicit match > registration hint > single candidate.
   function resolveProduct(order, productOverride) {
     if (productOverride) return productOverride;
@@ -776,11 +843,30 @@ function wireStorefront(app, { isInternalPayer }) {
   async function deliver(order, productOverride) {
     const product = resolveProduct(order, productOverride);
     if (!product) { // unresolved (ambiguous) or unmatched — publish a claim code
-      if (order.matched) {
-        order.claim_code = claimCode(order.tx);
-        store.save();
+      const claimable = order.matched ||
+        (order.classification === "external" && BigInt(order.amount_atomic || "0") >= CLAIM_MIN_ATOMIC);
+      if (claimable) {
+        order.claim_code = order.claim_code || claimCode(order.tx);
         log(`unresolved product for tx ${order.tx} — claim ${order.claim_code} published`);
       }
+      // Manual-pay recovery (Bean, Nov 15): an external payer who registered an
+      // email but whose transfer matches no catalog price gets a ONE-TIME
+      // payment-verified credit confirmation. delivered stays false (TRUTH:
+      // no product was delivered) — credit_recorded marks it handled.
+      if (claimable && order.classification === "external" && !order.delivered && !order.credit_recorded) {
+        const email0 = store.lookupEmail(order);
+        if (email0) {
+          try {
+            await sendCreditConfirmation(order, email0, process.env.RESEND_API_KEY);
+            order.credit_recorded = true;
+            store.markDelivered(order.tx, { email: email0, kind: "credit-confirmation", sent_at: Date.now(), email_id: null });
+            log(`credit confirmation sent to ${email0} for tx ${order.tx}`);
+          } catch (e) {
+            console.error("credit confirmation failed:", e.message, "tx", order.tx);
+          }
+        }
+      }
+      store.save();
       return;
     }
     order.product = product.id;
@@ -842,7 +928,7 @@ function wireStorefront(app, { isInternalPayer }) {
 
   app.get("/storefront/claims", (_req, res) => {
     const claims = store.state.orders
-      .filter(o => o.matched && !o.delivered && !store.lookupEmail(o))
+      .filter(o => (o.matched || o.claim_code) && !o.delivered && !o.credit_recorded && !store.lookupEmail(o))
       .map(o => ({
         tx: o.tx, product: o.product_name, amount_usd: o.amount_usd, payer: o.payer,
         claim_code: o.claim_code, ambiguous: Boolean(o.ambiguous), candidates: o.candidates || [],
@@ -868,9 +954,9 @@ function wireStorefront(app, { isInternalPayer }) {
       const sub = store.findSubByPayer(order.payer);
       if (sub && !sub.email) { sub.email = email; store.upsertSubscription(sub); }
     }
-    if (order && order.matched && !order.delivered) {
+    if (order && (order.matched || order.classification === "external") && !order.delivered) {
       deliver(order, null)
-        .then(() => res.json({ ok: true, delivered: Boolean(order.delivered), product: order.product_name || null, claim_code: order.claim_code || null }))
+        .then(() => res.json({ ok: true, delivered: Boolean(order.delivered), credit_recorded: Boolean(order.credit_recorded), product: order.product_name || null, claim_code: order.claim_code || null }))
         .catch(e => res.status(502).json({ ok: true, delivered: false, error: e.message.slice(0, 160) }));
       return;
     }
