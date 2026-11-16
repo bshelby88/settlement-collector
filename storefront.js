@@ -354,9 +354,9 @@ Sincerely,
 <p>Code: <code style="font-size:1.1em">${claimCode(order.tx)}</code> (one-time, does not expire)</p>
 <h2>2. How to redeem</h2>
 <ol>
-<li>Go to the RAEN contract-eye endpoint: <code>POST https://contract-eye-x402.fly.dev/analyze</code></li>
-<li>Header: <code>X-RAEN-CREDIT: ${claimCode(order.tx)}</code> — this replaces the x402 payment header for prepaid purchases.</li>
-<li>Body: <code>{"contract_text": "&lt;paste the full contract text&gt;"}</code></li>
+<li>Go to the RAEN contract-eye endpoint: <code>POST https://contract-eye-x402.fly.dev/api/analyze-contract</code></li>
+<li>Header: <code>X-RAEN-CREDIT: ${claimCode(order.tx)}</code> — this replaces the x402 payment header for prepaid purchases (the service verifies + burns the credit for you).</li>
+<li>Body: <code>{"text": "&lt;50-50000 chars of the full contract text&gt;"}</code></li>
 <li>You receive the structured risk report: unfavorable clauses, missing protections, ambiguity flags, and suggested redlines.</li>
 </ol>
 <h2>3. Tips for the best review</h2>
@@ -369,9 +369,9 @@ Sincerely,
 <p>Code: <code style="font-size:1.1em">${claimCode(order.tx)}</code> (one-time, does not expire)</p>
 <h2>2. How to redeem</h2>
 <ol>
-<li>Endpoint: <code>POST https://tradingagents-x402.fly.dev/analyze</code></li>
-<li>Header: <code>X-RAEN-CREDIT: ${claimCode(order.tx)}</code> — this replaces the x402 payment header for prepaid purchases.</li>
-<li>Body: <code>{"ticker": "AAPL", "depth": "standard"}</code></li>
+<li>Endpoint: <code>POST https://tradingagents-x402.fly.dev/api/analyze-ticker</code></li>
+<li>Header: <code>X-RAEN-CREDIT: ${claimCode(order.tx)}</code> — this replaces the x402 payment header for prepaid purchases (the service verifies + burns the credit for you).</li>
+<li>Body: <code>{"ticker": "AAPL"}</code> (optional <code>"date": "YYYY-MM-DD"</code>)</li>
 <li>You receive the full analyst-team debate output: fundamentals, sentiment, news flow, and a risk-scored thesis.</li>
 </ol>
 <h2>3. Brief template (fill from your analysis output)</h2>
@@ -809,17 +809,17 @@ const ONBOARD_ROUTES = {
   "contract-review": {
     label: "Contract Review credit ($19 — prepaid)",
     note: "You already paid, so use your credit header instead of an x402 payment — no second charge.",
-    curl: `curl -i -X POST https://contract-eye-x402.fly.dev/analyze \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery email>" \\\n  -d '{"contract_text":"<paste the full contract text>"}'`,
+    curl: `curl -i -X POST https://contract-eye-x402.fly.dev/api/analyze-contract \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery webhook>" \\\n  -d '{"text":"<50-50000 chars of the full contract text>"}'`,
   },
   "contract-watch": {
     label: "Contract Watch, 30-day ($19 — prepaid, recurring)",
     note: "Same endpoint as Contract Review; your weekly re-reviews ride on the same credit header.",
-    curl: `curl -i -X POST https://contract-eye-x402.fly.dev/analyze \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery email>" \\\n  -d '{"contract_text":"<paste the full contract text>"}'`,
+    curl: `curl -i -X POST https://contract-eye-x402.fly.dev/api/analyze-contract \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery webhook>" \\\n  -d '{"text":"<50-50000 chars of the full contract text>"}'`,
   },
   "market-intel-pack": {
     label: "Market Intel Pack ($29 — prepaid)",
     note: "You already paid, so use your credit header instead of an x402 payment — no second charge.",
-    curl: `curl -i -X POST https://tradingagents-x402.fly.dev/analyze \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery email>" \\\n  -d '{"ticker":"AAPL","depth":"standard"}'`,
+    curl: `curl -i -X POST https://tradingagents-x402.fly.dev/api/analyze-ticker \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery webhook>" \\\n  -d '{"ticker":"AAPL"}'`,
   },
 };
 // Skills are delivered inline by email — no API call. T0 still gives the
@@ -1325,6 +1325,38 @@ function wireStorefront(app, { isInternalPayer }) {
       return;
     }
     res.json({ ok: true, delivered: false, note: "email registered — delivery fires when the matching on-chain payment is observed" });
+  });
+
+  // Credit authority (Bean, 2026-11-16): the claim code (RAEN-<sha256(tx)[:10]>) is
+  // the prepaid SKU's machine redemption key. GET verifies; POST redeems one-time.
+  // The paid services (contract-eye, tradingagents) call redeem here before serving
+  // a prepaid call instead of collecting x402 payment — this is what makes the
+  // delivery copy's X-RAEN-CREDIT promise REAL instead of fiction.
+  function orderByCode(code) {
+    const want = String(code || "").trim().toUpperCase();
+    if (!/^RAEN-[0-9A-F]{10}$/.test(want)) return null;
+    return store.state.orders.find(o => o.claim_code === want || claimCode(o.tx) === want) || null;
+  }
+  app.get("/storefront/credits/:code", (req, res) => {
+    const order = orderByCode(req.params.code);
+    if (!order) return res.status(404).json({ ok: false, error: "unknown credit code" });
+    if (!order.delivered && !order.matched && order.classification !== "external")
+      return res.status(404).json({ ok: false, error: "credit not backed by a paid order" });
+    res.json({ ok: true, product: order.product || order.product_name || null, product_name: order.product_name || null,
+      amount_usd: order.amount_usd || null, tx: order.tx, redeemed: Boolean(order.credit_redeemed) });
+  });
+  app.post("/storefront/credits/:code/redeem", (req, res) => {
+    const order = orderByCode(req.params.code);
+    if (!order) return res.status(404).json({ ok: false, error: "unknown credit code" });
+    if (!order.delivered && !order.matched && order.classification !== "external")
+      return res.status(404).json({ ok: false, error: "credit not backed by a paid order" });
+    if (order.credit_redeemed)
+      return res.status(409).json({ ok: false, error: "credit already redeemed", redeemed_at: order.credit_redeemed_at, product: order.product || order.product_name || null });
+    order.credit_redeemed = true;
+    order.credit_redeemed_at = new Date().toISOString();
+    store.save();
+    log(`credit ${claimCode(order.tx)} redeemed (${order.product || order.product_name || "unresolved"}) by ${String((req.body || {}).agent_id || "unknown").slice(0, 80)}`);
+    res.json({ ok: true, product: order.product || order.product_name || null, product_name: order.product_name || null, tx: order.tx });
   });
 
   app.get("/storefront/scan", (req, res) => {
