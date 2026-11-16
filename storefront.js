@@ -97,13 +97,14 @@ function loadState() {
         subscriptions: s.subscriptions || {},  // payer(lower) -> Contract Watch subscription
         subscribers: s.subscribers || {},      // email(lower) -> {source, at} (contact capture)
         followups: s.followups || {},          // email(lower) -> {due_at, sent_at} (Rico testimonial ask)
+        onboarding: s.onboarding || {},        // email(lower) -> PLAN 9 onboarding sequence state (Erica, Nov 15)
         connectors: s.connectors || {},        // code -> {name,email,audience,rate,created_at}
         connectorByEmail: s.connectorByEmail || {}, // email(lower) -> code
         commissions: s.commissions || [],      // {tx, connector, order_usd, commission_usd, at}
       };
     }
   } catch (e) { console.error("storefront restore failed:", e.message); }
-  return { cursor: 0, orders: [], registrations: {}, delivered: {}, subscriptions: {}, subscribers: {}, followups: {}, connectors: {}, connectorByEmail: {}, commissions: [] };
+  return { cursor: 0, orders: [], registrations: {}, delivered: {}, subscriptions: {}, subscribers: {}, followups: {}, onboarding: {}, connectors: {}, connectorByEmail: {}, commissions: [] };
 }
 
 function makeStore() {
@@ -727,6 +728,8 @@ async function deliverFreeStarter(store, email, ref, apiKey, log) {
   store.addSubscriber(email, "rico-free-tier");
   // Rico exchange: 3 days after delivery, ask for the testimonial + 2 peer intros.
   store.scheduleFollowup(email, Date.now() + 3 * 86400000);
+  // PLAN 9: free-tier registration also arms the 3-email onboarding sequence.
+  armOnboarding(store, email, { product: "dispute-starter-free", tx, source: "free-tier" });
   log(`free-tier 'first 10 dispute letters' issued to ${email}${ref ? " via connector " + ref : ""} (tx ${tx})`);
   return { tx, email };
 }
@@ -762,6 +765,225 @@ same as yours were.</p>
     } catch (e) {
       out.failed++;
       log(`rico follow-up failed for ${email}: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+// ---------- PLAN 9 onboarding sequence (Erica, Nov 15) ----------
+// Fires on ANY buyer email registration — purchase (/storefront/register),
+// free tier (/storefront/free-tier), or claim/credit capture. Three emails:
+//   T+0   receipt + a ready-to-paste curl for THEIR SKU + the 402→200 flow
+//   T+1   verified-tx follow-up — adjacent-SKU suggestions, volume economics
+//   T+7   week-one value ledger — usage summary, receipts, what's next
+// TRUTH rule (ERICA MAX EFFORT §3, binding): every email contains ONLY facts
+// read back from chain/telemetry. A buyer whose settlement cannot be verified
+// gets NO revenue claim — just the integration help.
+
+const STATUS_URL = "https://settlement-collector.fly.dev/stats";
+const VALUE_LEDGER_URL = "https://bshelby88.github.io/raen-agent-directory/value-ledger.html";
+const FAQ_URL = "https://bshelby88.github.io/raen-agent-directory/faq.html";
+const DISCUSSIONS_URL = "https://github.com/orgs/x402/discussions";
+
+// Per-SKU T0 curl + routing notes. Email-delivered products get the matching
+// live API surface so the buyer always has a machine-callable route in hand.
+const ONBOARD_ROUTES = {
+  "dispute-package": {
+    label: "Dispute Package ($49 — delivered by email)",
+    note: "Your package itself arrives by email. The curl below is the live per-call API surface for the same dispute-letter engine, if you want machine access.",
+    curl: `curl -i -X POST https://sentry-forge-x402.fly.dev/api/dispute-pack \\\n  -H "Content-Type: application/json" \\\n  -d '{"case_summary":"<your dispute facts>"}'`,
+  },
+  "dispute-starter-free": {
+    label: "First 10 Dispute Letters — Free (delivered by email)",
+    note: "Your letters arrive by email. The curl below hits the free example of the same engine live — no payment needed for the example.",
+    curl: `curl -i https://sentry-forge-x402.fly.dev/api/dispute-pack/example`,
+  },
+  "contract-review": {
+    label: "Contract Review credit ($19 — prepaid)",
+    note: "You already paid, so use your credit header instead of an x402 payment — no second charge.",
+    curl: `curl -i -X POST https://contract-eye-x402.fly.dev/analyze \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery email>" \\\n  -d '{"contract_text":"<paste the full contract text>"}'`,
+  },
+  "contract-watch": {
+    label: "Contract Watch, 30-day ($19 — prepaid, recurring)",
+    note: "Same endpoint as Contract Review; your weekly re-reviews ride on the same credit header.",
+    curl: `curl -i -X POST https://contract-eye-x402.fly.dev/analyze \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery email>" \\\n  -d '{"contract_text":"<paste the full contract text>"}'`,
+  },
+  "market-intel-pack": {
+    label: "Market Intel Pack ($29 — prepaid)",
+    note: "You already paid, so use your credit header instead of an x402 payment — no second charge.",
+    curl: `curl -i -X POST https://tradingagents-x402.fly.dev/analyze \\\n  -H "Content-Type: application/json" \\\n  -H "X-RAEN-CREDIT: <your claim code from the delivery email>" \\\n  -d '{"ticker":"AAPL","depth":"standard"}'`,
+  },
+};
+// Skills are delivered inline by email — no API call. T0 still gives the
+// catalog + status surfaces so a skill buyer can see the fleet is live.
+ONBOARD_ROUTES["skill-steward-pattern"] =
+ONBOARD_ROUTES["skill-charge-and-rebate"] =
+ONBOARD_ROUTES["skill-x402-production"] =
+ONBOARD_ROUTES["skill-bundle"] = {
+  label: "RAEN skill (delivered by email)",
+  note: "Your skill content is in your delivery email — no API call needed. The curl below is the catalog, so you can see everything live and priced.",
+  curl: `curl -i https://settlement-collector.fly.dev/storefront/catalog`,
+};
+
+// Adjacent-SKU suggestions for T+1 — only live, purchasable surfaces.
+const ADJACENT = {
+  "dispute-package": ["contract-review", "market-intel-pack"],
+  "dispute-starter-free": ["contract-review", "market-intel-pack"],
+  "contract-review": ["market-intel-pack", "skill-x402-production"],
+  "contract-watch": ["market-intel-pack", "skill-x402-production"],
+  "market-intel-pack": ["contract-review", "skill-steward-pattern"],
+  "skill-steward-pattern": ["skill-charge-and-rebate", "contract-review"],
+  "skill-charge-and-rebate": ["skill-steward-pattern", "contract-review"],
+  "skill-x402-production": ["skill-bundle", "contract-review"],
+  "skill-bundle": ["contract-review", "market-intel-pack"],
+};
+const adjacentLine = (productId) =>
+  (ADJACENT[productId] || []).map(id => CATALOG[id] ? `- **${CATALOG[id].name}** — $${CATALOG[id].price_usd}` : null).filter(Boolean).join("<br>") || "- browse the full catalog";
+
+// armOnboarding: record/refresh a buyer's sequence state. One sequence per
+// email; a later registration refreshes the SKU/tx facts but never re-sends
+// a step already sent.
+function armOnboarding(store, email, { product, tx, source }) {
+  const key = String(email).trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(key)) return null;
+  const now = Date.now();
+  const DAY = 86400000;
+  const cur = store.state.onboarding[key] || {
+    registered_at: now, t0_sent_at: null, t1_sent_at: null, t7_sent_at: null,
+    t0_due_at: now, t1_due_at: now + DAY, t7_due_at: now + 7 * DAY,
+  };
+  if (product && CATALOG[product]) { cur.product = product; cur.product_name = CATALOG[product].name; cur.price_usd = CATALOG[product].price_usd; }
+  if (tx) cur.tx = String(tx).toLowerCase();
+  if (source) cur.source = String(source).slice(0, 40);
+  store.state.onboarding[key] = cur;
+  store.save();
+  return cur;
+}
+
+// Verified-tx check for the T+1 value-ledger proof line: the buyer's tx is
+// only quoted when it exists as a real observed on-chain order. TRUTH: an
+// unverified buyer gets no revenue claim — just integration help.
+function verifiedTxFor(store, ob) {
+  if (!ob.tx) return null;
+  const o = store.findOrder(ob.tx);
+  if (o && o.payer && (o.matched || o.classification === "external" || o.delivered)) {
+    return { tx: o.tx, amount_usd: o.amount_usd, product: o.product_name || (ob.product_name || null), delivered: Boolean(o.delivered) };
+  }
+  return null;
+}
+
+async function sendOnboardingT0(store, email, ob, apiKey, log) {
+  const r = ONBOARD_ROUTES[ob.product] || {
+    label: ob.product_name || "RAEN purchase (registered)",
+    note: "Your delivery email has the details; reply to this one if anything is unclear.",
+    curl: `curl -i https://settlement-collector.fly.dev/storefront/catalog`,
+  };
+  const txLine = ob.tx && !ob.tx.startsWith("free-") ? `<br>Receipt key:<br><code>${esc(ob.tx)}</code>` : "";
+  const html = storefrontShell("Your RAEN x402 receipt + the 90-second integration check", `
+<p><b>What you registered for:</b> ${esc(r.label)}.${txLine}</p>
+<h2>The 90-second integration check</h2>
+<p>Ready-to-paste curl for your route:</p>
+<pre>${esc(r.curl)}</pre>
+<p>${esc(r.note)}</p>
+<h2>The 402 → 200 flow, in 3 lines</h2>
+<ol>
+<li>Call the route with no payment header → you get an <code>HTTP 402</code> with a payment challenge (price, payTo, network).</li>
+<li>Your client signs that challenge with USDC on Base and retries with the <code>X-PAYMENT</code> header.</li>
+<li>The route returns <code>200</code> and your settlement lands on-chain — visible in the public <a href="${VALUE_LEDGER_URL}">value ledger</a>.</li>
+</ol>
+<h2>Fleet status, any time</h2>
+<p><a href="${STATUS_URL}">settlement-collector /stats</a> — challenges, settlements, and failures, live. Answers to the seven questions every buyer asks: <a href="${FAQ_URL}">the RAEN answer library</a>.</p>
+<p><b>One ask:</b> reply with your use case — we tune the service around real buyers. Direct line: <code>ops@royalruby.io</code>.</p>`);
+  const out = await sendHtmlEmail(apiKey, {
+    to: email,
+    subject: "Your RAEN x402 receipt + the 90-second integration check",
+    html,
+  });
+  log(`onboarding T0 (receipt + integration check) sent to ${email} (${ob.product || "no product hint"})`);
+  return out;
+}
+
+async function sendOnboardingT1(store, email, ob, apiKey, log) {
+  const vt = verifiedTxFor(store, ob);
+  const proof = vt
+    ? `<p>Value-ledger proof: your settlement <code>${esc(vt.tx)}</code>${vt.product ? ` for ${esc(vt.product)}` : ""} (${vt.amount_usd} USDC) is verified on-chain. ${vt.delivered ? "Your delivery is confirmed sent." : ""} See it in the public <a href="${VALUE_LEDGER_URL}">value ledger</a>.</p>`
+    : `<p>We have not yet observed a verified settlement to quote on-chain for your registration${ob.tx ? ` (<code>${esc(ob.tx)}</code> is not yet an observed on-chain payment — if you already paid, reply with the tx and we will reconcile it the same day)` : " — if you pay per-call, your first settled tx will appear here as proof"}.</p>`;
+  const html = storefrontShell("Your first call — what to buy next", `
+${proof}
+<h2>What to buy next (matched to what you registered for)</h2>
+<p>${adjacentLine(ob.product)}</p>
+<h2>Volume economics</h2>
+<p>Everything above is per-call USDC on Base — no subscription required. At 100 calls/day, a $0.05 route costs $5/day. If your volume is steady, reply and tell us — pack pricing is on the roadmap queue and real buyer volume is what moves it.</p>
+<p>Direct line: <code>ops@royalruby.io</code>.</p>`);
+  const out = await sendHtmlEmail(apiKey, {
+    to: email,
+    subject: "Your first call worked — here's what to buy next",
+    html,
+  });
+  log(`onboarding T1 (verified-tx follow-up${vt ? ", proof included" : ", no verified tx — honest no-claim variant"}) sent to ${email}`);
+  return out;
+}
+
+async function sendOnboardingT7(store, email, ob, apiKey, log) {
+  // Week-one usage summary — only from recorded state, never invented.
+  const regs = Object.entries(store.state.registrations)
+    .filter(([, r]) => r && r.email && r.email.toLowerCase() === email)
+    .map(([k, r]) => ({ key: k, ...r }));
+  const myOrders = store.state.orders
+    .filter(o => regs.some(r => r.key === o.tx) || (o.tx && regs.some(r => r.key === o.tx)))
+    .map(o => ({ tx: o.tx, product: o.product_name, amount_usd: o.amount_usd, delivered: o.delivered, at: o.seen_at }));
+  const usageRows = myOrders.length
+    ? myOrders.slice(-10).map(o => `<li><code>${esc(o.tx.slice(0, 20))}…</code> — ${esc(o.product || "registered")} — $${o.amount_usd} — ${o.delivered ? "delivered" : "on record"}</li>`).join("")
+    : "<li>No calls recorded from this email in week one — that's useful signal too; reply and tell us what blocked you.</li>";
+  const html = storefrontShell("Your week with RAEN: usage, receipts, and what we built from your feedback", `
+<h2>Week-one usage (from our recorded ledger, nothing invented)</h2>
+<ul>${usageRows}</ul>
+<h2>What we're building next (from live demand data)</h2>
+<ul>
+<li>Pack pricing for steady-volume buyers — queued, driven by real volume reports (see day-1 email).</li>
+<li>Better free discovery on every SKU — free example routes like <code>/api/dispute-pack/example</code> are the pattern we're extending.</li>
+</ul>
+<h2>If you serve clients</h2>
+<p>The connector program is live: white-label dispute letters at $0.75/letter, 20% lifetime commission on referred spend, no minimums — <a href="https://settlement-collector.fly.dev/connector">join here</a>, terms verified on the <a href="https://settlement-collector.fly.dev/connector/stats">public connector ledger</a>.</p>
+<h2>Community</h2>
+<p>Buyers debug x402 challenges in public at the <a href="${DISCUSSIONS_URL}">x402 GitHub discussions</a> — we answer there daily. The standing answers to the seven most common questions: <a href="${FAQ_URL}">answer library</a>.</p>
+<p>Direct line: <code>ops@royalruby.io</code>.</p>`);
+  const out = await sendHtmlEmail(apiKey, {
+    to: email,
+    subject: "Your week with RAEN: usage, receipts, and what we built from your feedback",
+    html,
+  });
+  log(`onboarding T7 (week-one value ledger) sent to ${email} (${myOrders.length} recorded orders)`);
+  return out;
+}
+
+// Daily pass (extends the Rico followup-cron pattern): walk every armed
+// onboarding state and send whichever step is due, strictly in order.
+async function checkOnboarding(store, apiKey, log = console.log) {
+  const out = { checked: 0, t0: 0, t1: 0, t7: 0, failed: 0 };
+  const now = Date.now();
+  for (const [email, ob] of Object.entries(store.state.onboarding)) {
+    out.checked++;
+    try {
+      if (!ob.t0_sent_at && ob.t0_due_at <= now) {
+        await sendOnboardingT0(store, email, ob, apiKey, log);
+        ob.t0_sent_at = Date.now();
+        out.t0++;
+        store.save();
+      } else if (ob.t0_sent_at && !ob.t1_sent_at && ob.t1_due_at <= now) {
+        await sendOnboardingT1(store, email, ob, apiKey, log);
+        ob.t1_sent_at = Date.now();
+        out.t1++;
+        store.save();
+      } else if (ob.t1_sent_at && !ob.t7_sent_at && ob.t7_due_at <= now) {
+        await sendOnboardingT7(store, email, ob, apiKey, log);
+        ob.t7_sent_at = Date.now();
+        out.t7++;
+        store.save();
+      }
+    } catch (e) {
+      out.failed++;
+      log(`onboarding step failed for ${email}: ${e.message}`);
     }
   }
   return out;
@@ -948,6 +1170,12 @@ function wireStorefront(app, { isInternalPayer }) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required" });
     if (!key) return res.status(400).json({ error: "tx_or_intent required" });
     store.addRegistration(key, email, hint, ref);
+    // PLAN 9: any registration — purchase, claim, or pre-payment capture —
+    // arms the 3-email onboarding sequence and fires T0 immediately
+    // (best-effort; the daily cron retries if the send fails).
+    armOnboarding(store, email, { product: hint, tx: key, source: "register" });
+    setImmediate(() => checkOnboarding(store, process.env.RESEND_API_KEY, log)
+      .catch(e => log(`onboarding pass failed: ${e.message}`)));
     // if this tx already arrived, deliver immediately
     const order = store.findOrder(key.toLowerCase());
     if (order && order.payer) { // bind email to the payer's subscription if it lacks one
@@ -1109,6 +1337,53 @@ mark up 2-3x. First 10 letters free so you can see the quality."</p>
       .catch(e => res.status(502).json({ error: e.message }));
   });
 
+  // ---- PLAN 9 onboarding sequence (Erica, Nov 15) ----
+  // GET /storefront/onboarding — sequence status per registered buyer.
+  app.get("/storefront/onboarding", (_req, res) => {
+    const seq = Object.entries(store.state.onboarding).map(([email, ob]) => ({
+      email,
+      source: ob.source || null,
+      product: ob.product || null,
+      product_name: ob.product_name || null,
+      tx: ob.tx || null,
+      registered_at: ob.registered_at,
+      steps: {
+        t0: { due_at: ob.t0_due_at, sent_at: ob.t0_sent_at },
+        t1: { due_at: ob.t1_due_at, sent_at: ob.t1_sent_at },
+        t7: { due_at: ob.t7_due_at, sent_at: ob.t7_sent_at },
+      },
+    }));
+    res.json({
+      total: seq.length,
+      t0_sent: seq.filter(s => s.steps.t0.sent_at).length,
+      t1_sent: seq.filter(s => s.steps.t1.sent_at).length,
+      t7_sent: seq.filter(s => s.steps.t7.sent_at).length,
+      sequences: seq,
+    });
+  });
+
+  // GET /storefront/onboarding-cron?secret=... — cron-friendly onboarding pass
+  // (same pattern as followup-cron: T0/T+1/T+7, strictly in order).
+  app.get("/storefront/onboarding-cron", (req, res) => {
+    if (process.env.REPORT_CRON_SECRET && req.query.secret !== process.env.REPORT_CRON_SECRET)
+      return res.status(401).json({ error: "bad secret" });
+    checkOnboarding(store, process.env.RESEND_API_KEY, log)
+      .then(r => res.json({ ok: true, ...r }))
+      .catch(e => res.status(502).json({ error: e.message }));
+  });
+
+  // daily internal onboarding pass (same belt-and-braces pattern as subscriptions
+  // and the Rico followups)
+  let obBusy = false;
+  const obIv = setInterval(() => {
+    if (obBusy) return;
+    obBusy = true;
+    checkOnboarding(store, process.env.RESEND_API_KEY, log)
+      .catch(e => console.error("[storefront] onboarding cron failed:", e.message))
+      .finally(() => { obBusy = false; });
+  }, 24 * 60 * 60 * 1000);
+  if (obIv.unref) obIv.unref();
+
   // daily internal Rico follow-up pass (same belt-and-braces pattern as subscriptions)
   let fuBusy = false;
   const fuIv = setInterval(() => {
@@ -1123,4 +1398,4 @@ mark up 2-3x. First 10 letters free so you can see the quality."</p>
   return store;
 }
 
-module.exports = { wireStorefront, CATALOG, CANONICAL, matchProduct, claimCode, buildDeliverable, scanOnce, makeStore, upsertContractWatch, checkSubscriptions };
+module.exports = { wireStorefront, CATALOG, CANONICAL, matchProduct, claimCode, buildDeliverable, scanOnce, makeStore, upsertContractWatch, checkSubscriptions, armOnboarding, checkOnboarding, verifiedTxFor, ONBOARD_ROUTES, ADJACENT };
