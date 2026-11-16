@@ -478,14 +478,22 @@ app.get("/certify/:service", async (req, res) => {
       const payHdr = req.get("payment-signature") || req.get("x-payment");
       let payer = null, tx = null;
       if (payHdr) {
-        const p = JSON.parse(Buffer.from(payHdr, "base64").toString("utf8"));
+        let p = null;
+        try { p = JSON.parse(payHdr); } catch (e) { p = JSON.parse(Buffer.from(payHdr, "base64").toString("utf8")); }
         payer = (p.from || p.payer || null) || null;
         tx = p.transaction || p.transactionHash || (p.payload && p.payload.transaction) || null;
       }
       const ev = { service: "settlement-collector", event: "settled", route: "/certify/" + svc, price_usd: 0.01, status: 200, error_class: "", latency_ms: 0, tx: tx || "", payer: payer || "", ts: Date.now() };
       events.push(ev);
       persist(ev);
-    } catch (e) { /* telemetry must never break delivery */ }
+    } catch (e) {
+      // telemetry must never break delivery — record an unattributed settle
+      try {
+        const ev = { service: "settlement-collector", event: "settled", route: "/certify/" + svc, price_usd: 0.01, status: 200, error_class: "", latency_ms: 0, tx: "", payer: "", ts: Date.now() };
+        events.push(ev);
+        persist(ev);
+      } catch (_e2) { /* nothing more we can do */ }
+    }
     res.json(cert);
   } catch (e) {
     console.error("certify build failed:", e.message);
