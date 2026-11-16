@@ -18,11 +18,12 @@ const CLAIMS_URL = "https://settlement-collector.fly.dev/storefront/claims";
 const COOKBOOK = "https://bshelby88.github.io/x402-cookbook/";
 
 // The 13-SKU discovery layer: every live RAEN x402 manifest.
-// amount_atomic = quoted USDC units; /clearing/intent ALWAYS re-quotes live from the
+// amount_atomic = quoted USDC units; auto-re-harvested from each manifest every
+// 5 min (see harvestPrices). /clearing/intent ALWAYS re-quotes live from the
 // 402 challenge at call time — this table is discovery, not pricing truth.
 const CATALOG = [
   { service: "royal-ruby",     host: "royal-ruby-x402.fly.dev",   route: "/api/law-lookup",       sku: "law-lookup",       amount: 50000,   name: "Law lookup" },
-  { service: "dispute-forge",  host: "dispute-forge-x402.fly.dev",route: "/api/dispute-pack",     sku: "dispute-pack",     amount: 750000,  name: "Dispute pack" },
+  { service: "dispute-forge",  host: "dispute-forge-x402.fly.dev",route: "/api/dispute-pack",     sku: "dispute-pack",     amount: 100000,  name: "Dispute pack" },
   { service: "nanobanana",     host: "nanobanana-x402.fly.dev",   route: "/api/generate-image",   sku: "generate-image",   amount: 10000,   name: "Image generation" },
   { service: "briefsnap",      host: "briefsnap-x402.fly.dev",    route: "/api/summarize",        sku: "summarize",        amount: 1000000, name: "Brief summary" },
   { service: "contract-eye",   host: "contract-eye-x402.fly.dev", route: "/api/analyze-contract", sku: "analyze-contract", amount: 50000,   name: "Contract analysis" },
@@ -31,10 +32,39 @@ const CATALOG = [
   { service: "sentry-forge",   host: "sentry-forge-x402.fly.dev", route: "/api/dispute-pack",     sku: "dispute-pack",     amount: 5000000, name: "Sentry dispute pack" },
   { service: "vault-pro",      host: "vault-pro-x402.fly.dev",    route: "/api/scaffold-project", sku: "scaffold-project", amount: 50000,   name: "Project scaffold" },
   { service: "x402-enterprise",host: "x402-enterprise.fly.dev",   route: "/api/dispute-pack",     sku: "dispute-pack",     amount: 750000,  name: "Enterprise dispute pack" },
-  { service: "nft-alpha",      host: "nft-alpha-x402.fly.dev",    route: "/api/nft-signal",       sku: "nft-signal",       amount: 50000,   name: "NFT signal" },
+  { service: "nft-alpha",      host: "nft-alpha-x402.fly.dev",    route: "/api/nft-signal",       sku: "nft-signal",       amount: 20000,   name: "NFT signal" },
   { service: "suprapack",      host: "suprapack-x402.fly.dev",    route: "/api/find-skill",       sku: "find-skill",       amount: 50000,   name: "Skill lookup" },
-  { service: "tradingagents",  host: "tradingagents-x402.fly.dev",route: "/api/analyze-ticker",   sku: "analyze-ticker",   amount: 100000,  name: "Ticker analysis" },
+  { service: "tradingagents",  host: "tradingagents-x402.fly.dev",route: "/api/analyze-ticker",   sku: "analyze-ticker",   amount: 50000,   name: "Ticker analysis" },
 ];
+
+// Price truth: manifests beat the static seed. Re-harvest every SKU's live price
+// from its x402 manifest (5-min TTL, and on catalog request if stale) so the
+// catalog never drifts from what the services actually charge.
+const PRICE_TTL_MS = 5 * 60 * 1000;
+let lastHarvest = 0;
+function parseManifestPrice(accepts) {
+  if (!accepts) return null;
+  if (accepts.amount != null && Number.isFinite(Number(accepts.amount)) && Number(accepts.amount) > 0) return Number(accepts.amount);
+  const p = typeof accepts.price === "string" ? parseFloat(accepts.price.replace(/[^0-9.]/g, "")) : NaN;
+  return Number.isFinite(p) && p > 0 ? Math.round(p * 1e6) : null;
+}
+async function harvestPrices() {
+  const results = await Promise.allSettled(CATALOG.map(async (c) => {
+    const r = await fetch(`https://${c.host}/.well-known/x402.json`, { headers: { "User-Agent": "raen-clearing/1.0" }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error(`manifest HTTP ${r.status}`);
+    const m = await r.json();
+    const price = parseManifestPrice((((m || {}).endpoints || {})[c.route] || {}).accepts);
+    if (price == null) throw new Error("no price in manifest");
+    if (c.amount !== price) { console.error(`clearing price sync: ${c.service} ${dec6(c.amount)} -> ${dec6(price)} (manifest)`); c.amount = price; }
+  }));
+  lastHarvest = Date.now();
+  return results;
+}
+function startPriceHarvest() {
+  const run = () => harvestPrices().catch((e) => console.error("clearing price harvest failed:", e.message));
+  run();
+  const t = setInterval(run, PRICE_TTL_MS); if (t.unref) t.unref();
+}
 const byKey = {};
 for (const c of CATALOG) { byKey[c.service] = c; byKey[c.sku] = c; }
 
@@ -136,6 +166,8 @@ function wireClearing(app, events) {
     }
   } catch (e) { console.error("clearing restore failed:", e.message); }
 
+  startPriceHarvest(); // keep catalog prices synced to live manifests (5-min TTL)
+
   // A. POST /clearing/intent {buyer, service, sku} → full transaction path envelope.
   app.post("/clearing/intent", async (req, res) => {
     const b = req.body || {};
@@ -175,9 +207,12 @@ function wireClearing(app, events) {
     res.json(envelope);
   });
 
-  // Catalog listing for agents.
-  app.get("/clearing/catalog.json", (_req, res) => {
-    res.json({ version: 1, network: "eip155:8453", asset: USDC, skus: CATALOG.map(c => ({ service: c.service, sku: c.sku, name: c.name, route: c.route, manifest_url: `https://${c.host}/.well-known/x402.json`, catalog_price_usd: dec6(c.amount), note: "live price via POST /clearing/intent" })) });
+  // Catalog listing for agents. Re-harvests live manifest prices when stale so
+  // catalog_price_usd tracks what the services actually charge (402 re-quote
+  // still happens per-intent at /clearing/intent).
+  app.get("/clearing/catalog.json", async (_req, res) => {
+    if (Date.now() - lastHarvest > PRICE_TTL_MS) { try { await harvestPrices(); } catch { /* serve current table */ } }
+    res.json({ version: 1, network: "eip155:8453", asset: USDC, prices_synced_at: lastHarvest ? new Date(lastHarvest).toISOString() : null, skus: CATALOG.map(c => ({ service: c.service, sku: c.sku, name: c.name, route: c.route, manifest_url: `https://${c.host}/.well-known/x402.json`, catalog_price_usd: dec6(c.amount), note: "synced from live x402 manifest; exact price re-quoted at POST /clearing/intent" })) });
   });
 
   // POST /clearing/record {clearing_id, tx, payer} → on-chain verify → record.
