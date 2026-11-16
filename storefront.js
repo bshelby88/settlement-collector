@@ -125,7 +125,15 @@ function makeStore() {
     save,
     findOrder: (tx) => state.orders.find(o => o.tx === tx),
     addOrder: (o) => { state.orders.push(o); if (state.orders.length > 5000) state.orders = state.orders.slice(-5000); save(); },
-    addRegistration: (key, email, productHint, ref) => { state.registrations[String(key).toLowerCase()] = { email, product_hint: productHint || null, ref: ref || null, at: Date.now() }; save(); },
+    addRegistration: (key, email, productHint, ref, extra) => { state.registrations[String(key).toLowerCase()] = { email: email || null, product_hint: productHint || null, ref: ref || null, at: Date.now(), ...(extra || {}) }; save(); },
+    lookupRegistration: (order) => {
+      const keys = [order.tx, order.payer].map(k => String(k).toLowerCase());
+      for (const k of keys) {
+        const r = state.registrations[k];
+        if (r && typeof r === "object") return r;
+      }
+      return null;
+    },
     lookupEmail: (order) => {
       const keys = [order.tx, order.payer].map(k => String(k).toLowerCase());
       for (const k of keys) {
@@ -842,22 +850,101 @@ const adjacentLine = (productId) =>
 
 // armOnboarding: record/refresh a buyer's sequence state. One sequence per
 // email; a later registration refreshes the SKU/tx facts but never re-sends
-// a step already sent.
-function armOnboarding(store, email, { product, tx, source }) {
-  const key = String(email).trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(key)) return null;
+// a step already sent. MACHINE-FIRST LAW: the key may also be an https
+// callback_url for machine buyers (channel 'webhook') — machines don't read
+// email, so their T0/T1/T7 steps arrive as HTTP POSTs to callback_url.
+function armOnboarding(store, key, { product, tx, source, channel, callback_url, agent_id }) {
+  const k = String(key).trim().toLowerCase();
+  const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(k);
+  const isUrl = /^https:\/\/[^\s]+$/.test(k);
+  if (!isEmail && !isUrl) return null;
   const now = Date.now();
   const DAY = 86400000;
-  const cur = store.state.onboarding[key] || {
+  const cur = store.state.onboarding[k] || {
     registered_at: now, t0_sent_at: null, t1_sent_at: null, t7_sent_at: null,
     t0_due_at: now, t1_due_at: now + DAY, t7_due_at: now + 7 * DAY,
   };
   if (product && CATALOG[product]) { cur.product = product; cur.product_name = CATALOG[product].name; cur.price_usd = CATALOG[product].price_usd; }
   if (tx) cur.tx = String(tx).toLowerCase();
   if (source) cur.source = String(source).slice(0, 40);
-  store.state.onboarding[key] = cur;
+  if (isUrl || callback_url) {
+    cur.channel = "webhook";
+    cur.callback_url = String(callback_url || key).trim();
+    cur.agent_id = agent_id ? String(agent_id).slice(0, 120) : null;
+  }
+  store.state.onboarding[k] = cur;
   store.save();
   return cur;
+}
+
+// ---------- MACHINE-FIRST LAW: webhook delivery for machine buyers ----------
+// Machines don't read email. When a registration carries callback_url, the
+// receipt, product delivery, and onboarding steps arrive as HTTP POSTs.
+
+const CATALOG_URL = "https://settlement-collector.fly.dev/storefront/catalog";
+const CLAIMS_URL = "https://settlement-collector.fly.dev/storefront/claims";
+const REGISTER_URL = "https://settlement-collector.fly.dev/storefront/register";
+
+async function postWebhook(url, payload) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": "RAEN-settlement-collector/1.0 (x402 machine onboarding)" },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    return { status: r.status };
+  } finally { clearTimeout(t); }
+}
+
+// Product delivery receipt (same moment an email buyer gets the delivery mail).
+async function deliverWebhookReceipt(order, product, reg, log = console.log) {
+  const payload = {
+    type: "delivery",
+    tx: order.tx,
+    product: product.id,
+    product_name: product.name,
+    amount_usd: order.amount_usd || null,
+    claim_code: order.claim_code || null,
+    catalog_url: CATALOG_URL,
+    claims_url: CLAIMS_URL,
+    agent_id: reg.agent_id || null,
+    delivered_at: new Date().toISOString(),
+  };
+  const r = await postWebhook(reg.callback_url, payload);
+  if (r.status >= 300) throw new Error(`delivery webhook got HTTP ${r.status}`);
+  log(`delivery webhook POSTed to ${reg.agent_id || reg.callback_url} for tx ${order.tx}`);
+}
+
+// Onboarding steps T0/T1/T7 as webhooks — same facts, same TRUTH rule, no email.
+async function sendOnboardingWebhook(store, key, ob, step, log = console.log) {
+  const route = ONBOARD_ROUTES[ob.product] || {
+    label: ob.product_name || "RAEN purchase (registered)",
+    note: "Your receipt and integration route are in this payload.",
+    curl: `curl -i ${CATALOG_URL}`,
+  };
+  const payload = {
+    type: "onboarding",
+    step,
+    product: ob.product || null,
+    product_name: ob.product_name || null,
+    price_usd: ob.price_usd || null,
+    tx: ob.tx || null,
+    label: route.label,
+    note: route.note,
+    integration_curl: route.curl,
+    catalog_url: CATALOG_URL,
+    claims_url: CLAIMS_URL,
+    register_url: REGISTER_URL,
+    status_url: STATUS_URL,
+    agent_id: ob.agent_id || null,
+    sent_at: new Date().toISOString(),
+  };
+  const r = await postWebhook(ob.callback_url, payload);
+  if (r.status >= 300) throw new Error(`onboarding ${step} webhook got HTTP ${r.status}`);
+  log(`onboarding ${step} webhook delivered to ${ob.agent_id || ob.callback_url}`);
 }
 
 // Verified-tx check for the T+1 value-ledger proof line: the buyer's tx is
@@ -962,28 +1049,32 @@ async function sendOnboardingT7(store, email, ob, apiKey, log) {
 async function checkOnboarding(store, apiKey, log = console.log) {
   const out = { checked: 0, t0: 0, t1: 0, t7: 0, failed: 0 };
   const now = Date.now();
-  for (const [email, ob] of Object.entries(store.state.onboarding)) {
+  for (const [key, ob] of Object.entries(store.state.onboarding)) {
     out.checked++;
     try {
+      const isWebhook = ob.channel === "webhook" && ob.callback_url;
       if (!ob.t0_sent_at && ob.t0_due_at <= now) {
-        await sendOnboardingT0(store, email, ob, apiKey, log);
+        if (isWebhook) await sendOnboardingWebhook(store, key, ob, "T0", log);
+        else await sendOnboardingT0(store, key, ob, apiKey, log);
         ob.t0_sent_at = Date.now();
         out.t0++;
         store.save();
       } else if (ob.t0_sent_at && !ob.t1_sent_at && ob.t1_due_at <= now) {
-        await sendOnboardingT1(store, email, ob, apiKey, log);
+        if (isWebhook) await sendOnboardingWebhook(store, key, ob, "T1", log);
+        else await sendOnboardingT1(store, key, ob, apiKey, log);
         ob.t1_sent_at = Date.now();
         out.t1++;
         store.save();
       } else if (ob.t1_sent_at && !ob.t7_sent_at && ob.t7_due_at <= now) {
-        await sendOnboardingT7(store, email, ob, apiKey, log);
+        if (isWebhook) await sendOnboardingWebhook(store, key, ob, "T7", log);
+        else await sendOnboardingT7(store, key, ob, apiKey, log);
         ob.t7_sent_at = Date.now();
         out.t7++;
         store.save();
       }
     } catch (e) {
       out.failed++;
-      log(`onboarding step failed for ${email}: ${e.message}`);
+      log(`onboarding step failed for ${key}: ${e.message}`);
     }
   }
   return out;
@@ -1093,6 +1184,23 @@ function wireStorefront(app, { isInternalPayer }) {
     }
     order.product = product.id;
     order.product_name = product.name;
+    // MACHINE-FIRST LAW: webhook-channel registration → receipt POSTs to the
+    // machine's callback_url; no email is ever involved.
+    const reg = store.lookupRegistration(order);
+    if (reg && reg.channel === "webhook" && reg.callback_url) {
+      if (order.delivered) return;
+      await deliverWebhookReceipt(order, product, reg, log);
+      order.delivered = true;
+      store.markDelivered(order.tx, { email: null, channel: "webhook", callback_url: reg.callback_url, sent_at: Date.now(), email_id: null });
+      store.save();
+      log(`delivered ${product.name} to machine ${reg.agent_id || reg.callback_url} via webhook for tx ${order.tx}`);
+      const refW = store.lookupRef(order);
+      if (refW && product.price_usd > 0) {
+        const commissionW = Math.round(product.price_usd * 0.20 * 10000) / 10000;
+        store.addCommission({ tx: order.tx, connector: refW, order_usd: product.price_usd, commission_usd: commissionW, at: Date.now() });
+      }
+      return;
+    }
     const email = store.lookupEmail(order);
     if (product.id === "contract-watch") upsertContractWatch(store, order, email);
     if (!email) { // on-chain only buyer — publish a claim code instead
@@ -1161,14 +1269,42 @@ function wireStorefront(app, { isInternalPayer }) {
   });
 
   // POST /storefront/register {tx_or_intent, email, product?, ref?}
+  // MACHINE-FIRST LAW: machines may register with {tx_or_intent, agent_id?,
+  // callback_url?} — when callback_url (https) is present, the receipt +
+  // claims URL are delivered by HTTP POST instead of email, and the T0/T1/T7
+  // onboarding sequence fires as webhooks. Same ledger, same TRUTH rule.
   app.post("/storefront/register", (req, res) => {
     const b = req.body || {};
     const email = String(b.email || "").trim();
     const key = String(b.tx_or_intent || "").trim();
+    const callbackUrl = String(b.callback_url || "").trim();
+    const agentId = String(b.agent_id || "").trim().slice(0, 120);
     const hint = String(b.product || "").trim() && CATALOG[String(b.product || "").trim()] ? String(b.product).trim() : null;
     const ref = store.state.connectors[String(b.ref || "").trim()] ? String(b.ref).trim() : null;
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required" });
     if (!key) return res.status(400).json({ error: "tx_or_intent required" });
+    if (callbackUrl) {
+      if (!/^https:\/\/[^\s]+$/.test(callbackUrl)) return res.status(400).json({ error: "callback_url must be an https URL" });
+      store.addRegistration(key, null, hint, ref, { channel: "webhook", callback_url: callbackUrl, agent_id: agentId || null });
+      armOnboarding(store, callbackUrl, { product: hint, tx: key, source: "machine-register", callback_url: callbackUrl, agent_id: agentId || null });
+      setImmediate(() => checkOnboarding(store, process.env.RESEND_API_KEY, log)
+        .catch(e => log(`onboarding pass failed: ${e.message}`)));
+      const mOrder = store.findOrder(key.toLowerCase());
+      if (mOrder && (mOrder.matched || mOrder.classification === "external") && !mOrder.delivered) {
+        deliver(mOrder, null).catch(e => log(`machine delivery failed: ${e.message}`));
+      }
+      return res.json({
+        ok: true,
+        channel: "webhook",
+        delivered: Boolean(mOrder && mOrder.delivered),
+        delivery_pending: Boolean(mOrder && (mOrder.matched || mOrder.classification === "external") && !mOrder.delivered),
+        agent_id: agentId || null,
+        callback_url: callbackUrl,
+        catalog_url: CATALOG_URL,
+        claims_url: CLAIMS_URL,
+        note: "Receipt + delivery notices POST to callback_url. Onboarding steps (T+0 receipt, T+1 verified-tx follow-up, T+7 value ledger) arrive as webhooks. Machines never need to read email.",
+      });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "valid email required (or pass callback_url for machine registration)" });
     store.addRegistration(key, email, hint, ref);
     // PLAN 9: any registration — purchase, claim, or pre-payment capture —
     // arms the 3-email onboarding sequence and fires T0 immediately

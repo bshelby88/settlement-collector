@@ -178,7 +178,7 @@ function wireClearing(app, events) {
     const manifest_url = `https://${entry.host}/.well-known/x402.json`;
     const id = "clr_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
     const envelope = {
-      clearing_api_version: 1,
+      clearing_api_version: 2,
       clearing_id: id,
       buyer: String(b.buyer),
       service: entry.service,
@@ -200,6 +200,12 @@ function wireClearing(app, events) {
       step_4_fulfillment: { method: "POST", url: `https://${entry.host}${entry.route}`, note: "REPEAT the original request with the x-payment header; the paid response returns with a payment-response header containing the settle tx hash." },
       step_5_record: { method: "POST", url: "https://settlement-collector.fly.dev/clearing/record", body: { clearing_id: id, tx: "<settle tx hash>", payer: "<buyer address>" }, note: "the collector verifies the settle on-chain before recording it" },
       step_6_status: { method: "GET", url: `https://settlement-collector.fly.dev/clearing/status/${id}` },
+      step_7_machine_registration: {
+        method: "POST",
+        url: "https://settlement-collector.fly.dev/storefront/register",
+        body: { tx_or_intent: "<settle tx hash or your intent id>", agent_id: "<your agent id (optional)>", callback_url: "https://<your-service>/webhook/raen" },
+        note: "MACHINE BUYERS: register with callback_url (https) and the receipt + claims URL arrive as an HTTP POST to your webhook instead of email — onboarding steps (T+0 receipt, T+1 verified-tx follow-up, T+7 value ledger) are delivered as webhooks too. Omit callback_url to use the classic email path.",
+      },
       claims_url: CLAIMS_URL, docs: COOKBOOK,
     };
     const rec = { type: "intent", clearing_id: id, ts: Date.now(), buyer: String(b.buyer).toLowerCase(), service: entry.service, sku: entry.sku, route: entry.route, quote: envelope.step_2_quote, lifecycle: [{ at: Date.now(), state: "intent" }, { at: Date.now(), state: "quoted", amount_usd: (envelope.step_2_quote.amount_usd || dec6(entry.amount)) }] };
