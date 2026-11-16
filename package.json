@@ -3,6 +3,14 @@
   "version": "1.0.0",
   "description": "RAEN fleet settlement telemetry collector — per-service paid-route events, funnel stats, revenue rollup",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "dependencies": { "express": "^5.2.1" }
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@x402/core": "^2.31.0",
+    "@x402/evm": "^2.31.0",
+    "@x402/express": "^2.31.0",
+    "@x402/fetch": "^2.31.0",
+    "express": "^5.2.1"
+  }
 }
