@@ -172,7 +172,13 @@ app.get("/stats", (_req, res) => {
     const settled = byEvent.settled || 0;
     const challenges = byEvent.challenge || 0;
     const verified = list.filter(e => e.event === "settled" && e.tx); // TRUTH: revenue = tx-verified only
-    const revenue = verified.reduce((s, e) => s + (e.price_usd || 0), 0);
+    // TRUTH split (RE-AUDIT Nov 16): internal RAEN-wallet settles must never
+    // inflate the headline revenue figure. revenue_usd now counts EXTERNAL
+    // tx-verified settles only; internal splits into its own field.
+    const externalVerified = verified.filter(e => !isInternalPayer(e.payer));
+    const internalVerified = verified.filter(e => isInternalPayer(e.payer));
+    const revenue = externalVerified.reduce((s, e) => s + (e.price_usd || 0), 0);
+    const internalRevenue = internalVerified.reduce((s, e) => s + (e.price_usd || 0), 0);
     const unverifiedRevenue = list.filter(e => e.event === "settled" && !e.tx)
       .reduce((s, e) => s + (e.price_usd || 0), 0);
     const lat = list.filter(e => e.event === "settled" && e.latency_ms > 0)
@@ -183,6 +189,8 @@ app.get("/stats", (_req, res) => {
       failed: byEvent.failed || 0, retries: byEvent.retry || 0,
       convert_pct: challenges + settled ? Math.round(100 * settled / (challenges + settled)) : null,
       revenue_usd: Math.round(revenue * 10000) / 10000,
+      revenue_external_usd: Math.round(revenue * 10000) / 10000,
+      revenue_internal_usd: Math.round(internalRevenue * 10000) / 10000,
       revenue_unverified_usd: Math.round(unverifiedRevenue * 10000) / 10000,
       p50_ms: lat.length ? lat[Math.floor(lat.length / 2)] : null,
       p95_ms: lat.length ? lat[Math.ceil(lat.length * 0.95) - 1] : null,

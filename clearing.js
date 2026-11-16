@@ -216,7 +216,7 @@ function wireClearing(app, events) {
   // Catalog listing for agents. Re-harvests live manifest prices when stale so
   // catalog_price_usd tracks what the services actually charge (402 re-quote
   // still happens per-intent at /clearing/intent).
-  app.get("/clearing/catalog.json", async (_req, res) => {
+  app.get(["/clearing/catalog", "/clearing/catalog.json"], async (_req, res) => {
     if (Date.now() - lastHarvest > PRICE_TTL_MS) { try { await harvestPrices(); } catch { /* serve current table */ } }
     res.json({ version: 1, network: "eip155:8453", asset: USDC, prices_synced_at: lastHarvest ? new Date(lastHarvest).toISOString() : null, skus: CATALOG.map(c => ({ service: c.service, sku: c.sku, name: c.name, route: c.route, manifest_url: `https://${c.host}/.well-known/x402.json`, catalog_price_usd: dec6(c.amount), note: "synced from live x402 manifest; exact price re-quoted at POST /clearing/intent" })) });
   });
@@ -248,6 +248,14 @@ function wireClearing(app, events) {
   });
 
   // GET /clearing/status/:idOrTx → live clearing lifecycle.
+  // GET /clearing/status (no key) → enumerate recent clearing intents so a
+  // keyless probe returns useful truth instead of a bare 404 (RE-AUDIT Nov 16).
+  app.get("/clearing/status", (_req, res) => {
+    const rows = Array.from(intents.values()).sort((a, b) => b.ts - a.ts).slice(0, 25)
+      .map((it) => ({ clearing_id: it.clearing_id, ts: it.ts, service: it.service, sku: it.sku, state: (it.lifecycle || []).some((s) => s.state === "settled_on_chain") ? "cleared" : "quoted" }));
+    res.json({ version: 1, note: "GET /clearing/status/<clearing_id-or-tx> for the full lifecycle", count: rows.length, recent: rows });
+  });
+
   app.get("/clearing/status/:key", (req, res) => {
     const k = String(req.params.key).trim();
     const id = k.startsWith("0x") && k.length === 66 ? byTx.get(k) : k;
