@@ -252,7 +252,7 @@ function wireClearing(app, events) {
   // keyless probe returns useful truth instead of a bare 404 (RE-AUDIT Nov 16).
   app.get("/clearing/status", (_req, res) => {
     const rows = Array.from(intents.values()).sort((a, b) => b.ts - a.ts).slice(0, 25)
-      .map((it) => ({ clearing_id: it.clearing_id, ts: it.ts, service: it.service, sku: it.sku, state: (it.lifecycle || []).some((s) => s.state === "settled_on_chain") ? "cleared" : "quoted" }));
+      .map((it) => ({ clearing_id: it.clearing_id, ts: it.ts, service: it.service, sku: it.sku, state: (it.lifecycle || []).some((s) => s && s.state === "settled_on_chain") ? "cleared" : "quoted" }));
     res.json({ version: 1, note: "GET /clearing/status/<clearing_id-or-tx> for the full lifecycle", count: rows.length, recent: rows });
   });
 
