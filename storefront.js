@@ -1121,9 +1121,48 @@ document.getElementById('cf').addEventListener('submit', async (e) => {
 }
 
 // ---------- wiring ----------
-function wireStorefront(app, { isInternalPayer }) {
+function wireStorefront(app, { isInternalPayer, collectorKey }) {
   const store = makeStore();
   const log = (...a) => console.log("[storefront]", ...a);
+
+  // RECOVERY-FUNNEL helpers (Staci, 2026-11-22)
+  const isTxHash = (s) => /^0x[0-9a-fA-F]{64}$/.test(s);
+  const isAddr = (s) => /^0x[0-9a-fA-F]{40}$/.test(s);
+  // lookup rate limit: 30 requests / 60s per IP (claims-by-tx/payer only)
+  const lookupHits = new Map();
+  function lookupRateLimit(req) {
+    const ip = String(req.ip || (req.headers && req.headers["x-forwarded-for"]) || "unknown").split(",")[0].trim();
+    const now = Date.now();
+    const arr = (lookupHits.get(ip) || []).filter(t => now - t < 60000);
+    if (arr.length >= 30) { lookupHits.set(ip, arr); return false; }
+    arr.push(now);
+    lookupHits.set(ip, arr);
+    return true;
+  }
+  // find an order by tx hash OR (for 20-hex keys) by payer address, newest first
+  function findOrderFor(key) {
+    const k = String(key || "").trim().toLowerCase();
+    if (!k) return undefined;
+    const byTx = store.state.orders.find(o => String(o.tx).toLowerCase() === k);
+    if (byTx) return byTx;
+    if (isAddr(k)) {
+      const byPayer = store.state.orders.filter(o => String(o.payer || "").toLowerCase() === k);
+      if (byPayer.length) return byPayer[byPayer.length - 1];
+    }
+    return undefined;
+  }
+  // re-delivery: an order flagged delivered (maybe to a stale/test target) gets
+  // delivery re-armed when a NEW registration target arrives. The delivery
+  // record's target is the dedupe key — same target never re-sends.
+  function armRedelivery(order, newTarget) {
+    if (!order || !order.delivered || !newTarget) return;
+    const rec = store.state.delivered[order.tx];
+    const priorTarget = rec ? String(rec.email || rec.callback_url || "") : "";
+    if (priorTarget.toLowerCase() !== String(newTarget).toLowerCase()) {
+      order.delivered = false;
+      log(`re-delivery armed for tx ${order.tx} — new registration target differs from the recorded delivery target`);
+    }
+  }
 
   // Manual-pay recovery backfill (Bean, Nov 15): external orders already seen
   // before this feature get claim codes so their payers can self-serve too.
@@ -1256,7 +1295,55 @@ function wireStorefront(app, { isInternalPayer }) {
     res.json({ total_orders: store.state.orders.length, matched: store.state.orders.filter(o => o.matched).length, orders });
   });
 
-  app.get("/storefront/claims", (_req, res) => {
+  app.get("/storefront/claims", (req, res) => {
+    // RECOVERY-FUNNEL (Staci, 2026-11-22): claims lookup by tx hash OR payer
+    // address — knowledge-of-tx becomes proof-of-payer. The payer's tx hash is
+    // the one artifact every x402 client retains; the claim code is derivable
+    // from it anyway (RAEN-<sha256(tx)[:10]>), so returning it for a tx the
+    // caller already knows adds no leak. No PII: emails/callback URLs are never
+    // returned. Light per-IP rate limit below stops enumeration hammering.
+    const q = req.query || {};
+    const txQ = String(q.tx || "").trim();
+    const payerQ = String(q.payer || "").trim();
+    if (txQ || payerQ) {
+      if (!lookupRateLimit(req)) return res.status(429).json({ error: "rate limit — slow down" });
+      if (txQ && !/^0x[0-9a-fA-F]{64}$/.test(txQ))
+        return res.status(400).json({ error: "tx must be a 0x-prefixed 32-byte hash" });
+      if (payerQ && !/^0x[0-9a-fA-F]{40}$/.test(payerQ))
+        return res.status(400).json({ error: "payer must be a 0x-prefixed 20-byte address" });
+      const txL = txQ.toLowerCase();
+      const payerL = payerQ.toLowerCase();
+      const matchedOrders = store.state.orders.filter(o =>
+        (txL && String(o.tx).toLowerCase() === txL) ||
+        (payerL && String(o.payer).toLowerCase() === payerL));
+      const claims = matchedOrders.map(o => {
+        const rec = store.state.delivered[o.tx] || null;
+        const claimable = Boolean(o.matched || o.claim_code ||
+          (o.classification === "external" && Number(o.amount_usd || 0) >= 0.01));
+        const state = o.credit_redeemed ? "credit_redeemed"
+          : o.delivered ? "delivered"
+          : claimable ? "open"
+          : "recorded";
+        return {
+          tx: o.tx, block: o.block || null, payer: o.payer, amount_usd: o.amount_usd,
+          product: o.product || null, product_name: o.product_name || null,
+          claim_code: o.claim_code || (claimable ? claimCode(o.tx) : null),
+          matched: Boolean(o.matched), ambiguous: Boolean(o.ambiguous),
+          delivered: Boolean(o.delivered),
+          delivery_channel: rec ? (rec.channel || (rec.kind === "credit-confirmation" ? "credit-confirmation" : "email")) : (o.delivered ? "email" : null),
+          credit_redeemed: Boolean(o.credit_redeemed),
+          registered: Boolean(store.lookupEmail(o) || (store.lookupRegistration(o) || {}).callback_url),
+          state, seen_at: o.seen_at,
+        };
+      });
+      return res.json({
+        found: claims.length > 0, lookup_by: txQ ? "tx" : "payer",
+        claims,
+        note: "open claim? register at /storefront/register with your tx hash (or payer address) + email, or callback_url for machine delivery. redeemed credits are one-time.",
+        resolve_url: "https://settlement-collector.fly.dev/storefront/register",
+        credits_verify_url: "https://settlement-collector.fly.dev/storefront/credits/<code>",
+      });
+    }
     const claims = store.state.orders
       .filter(o => (o.matched || o.claim_code) && !o.delivered && !o.credit_recorded && !store.lookupEmail(o))
       .map(o => ({
@@ -1288,7 +1375,8 @@ function wireStorefront(app, { isInternalPayer }) {
       armOnboarding(store, callbackUrl, { product: hint, tx: key, source: "machine-register", callback_url: callbackUrl, agent_id: agentId || null });
       setImmediate(() => checkOnboarding(store, process.env.RESEND_API_KEY, log)
         .catch(e => log(`onboarding pass failed: ${e.message}`)));
-      const mOrder = store.findOrder(key.toLowerCase());
+      const mOrder = findOrderFor(key);
+      armRedelivery(mOrder, callbackUrl);
       if (mOrder && (mOrder.matched || mOrder.classification === "external") && !mOrder.delivered) {
         deliver(mOrder, null).catch(e => log(`machine delivery failed: ${e.message}`));
       }
@@ -1313,7 +1401,10 @@ function wireStorefront(app, { isInternalPayer }) {
     setImmediate(() => checkOnboarding(store, process.env.RESEND_API_KEY, log)
       .catch(e => log(`onboarding pass failed: ${e.message}`)));
     // if this tx already arrived, deliver immediately
-    const order = store.findOrder(key.toLowerCase());
+    // RECOVERY-FUNNEL (Staci, 2026-11-22): tx_or_intent may also be a PAYER
+    // ADDRESS — a payer who retained only their wallet can still bind delivery.
+    const order = findOrderFor(key);
+    armRedelivery(order, email);
     if (order && order.payer) { // bind email to the payer's subscription if it lacks one
       const sub = store.findSubByPayer(order.payer);
       if (sub && !sub.email) { sub.email = email; store.upsertSubscription(sub); }
@@ -1357,6 +1448,31 @@ function wireStorefront(app, { isInternalPayer }) {
     store.save();
     log(`credit ${claimCode(order.tx)} redeemed (${order.product || order.product_name || "unresolved"}) by ${String((req.body || {}).agent_id || "unknown").slice(0, 80)}`);
     res.json({ ok: true, product: order.product || order.product_name || null, product_name: order.product_name || null, tx: order.tx });
+  });
+
+  // POST /storefront/ops/credit-rearm — fleet-ops only (X-COLLECTOR-KEY).
+  // RECOVERY-FUNNEL (Staci, 2026-11-22): a one-time credit consumed by an
+  // internal TEST (not by the payer) is a stranding, not a sale. This reverses
+  // a misredemption with a full audit trail — the redemption record moves into
+  // order.credit_history and the payer's redemption right is restored.
+  // It NEVER touches delivered flags, amounts, or classification (TRUTH law).
+  app.post("/storefront/ops/credit-rearm", (req, res) => {
+    if (!collectorKey || req.get("x-collector-key") !== collectorKey)
+      return res.status(401).json({ ok: false, error: "collector key required" });
+    const tx = String((req.body || {}).tx || "").trim().toLowerCase();
+    const reason = String((req.body || {}).reason || "").slice(0, 300);
+    if (!/^0x[0-9a-f]{64}$/.test(tx)) return res.status(400).json({ ok: false, error: "tx must be a 0x-prefixed 32-byte hash" });
+    if (!reason) return res.status(400).json({ ok: false, error: "reason required (audit trail)" });
+    const order = store.state.orders.find(o => String(o.tx).toLowerCase() === tx);
+    if (!order) return res.status(404).json({ ok: false, error: "tx not found" });
+    if (!order.credit_redeemed) return res.status(409).json({ ok: false, error: "credit is not redeemed" });
+    order.credit_history = order.credit_history || [];
+    order.credit_history.push({ redeemed_at: order.credit_redeemed_at || null, rearmed_at: new Date().toISOString(), reason });
+    order.credit_redeemed = false;
+    delete order.credit_redeemed_at; // preserved in credit_history
+    store.save();
+    log(`credit re-arm for tx ${tx}: ${reason}`);
+    res.json({ ok: true, tx, claim_code: order.claim_code || claimCode(order.tx), credit_history: order.credit_history });
   });
 
   app.get("/storefront/scan", (req, res) => {

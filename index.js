@@ -426,7 +426,7 @@ certifyX402Server.register(CERTIFY_NETWORK, new ExactEvmScheme());
 const certifyPayment = paymentMiddleware(certifyGateRoutes, certifyX402Server, undefined, undefined, false);
 
 // store the storefront store handle for open-claim counts (wireStorefront returns its store)
-const storefrontStore = wireStorefront(app, { isInternalPayer });
+const storefrontStore = wireStorefront(app, { isInternalPayer, collectorKey: COLLECTOR_KEY });
 wireClearing(app, () => events);
 
 // FREE discovery: what this is + how to pay + how to verify signatures
