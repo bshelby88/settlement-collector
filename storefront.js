@@ -3,10 +3,19 @@
 // matches amounts to the product catalog, stores orders, and auto-delivers via
 // the collector's working Resend path. No human in the transaction loop.
 //
+// LEGACY-PAYEE STRANDING WATCH (Staci, 2026-11-22): the retired treasury
+// 0x7861…1393 is still SERVED by the facilitator (KEEP verdict — services and
+// stale directories can still name it), so a buyer whose challenge said the
+// legacy payee can pay real USDC that the canonical-only watcher would never
+// see. scanOnce now ALSO scans transfers to the legacy payee and auto-creates
+// an order + claim code for each one — a legacy-named settle is never
+// invisible; its payer can self-serve at /storefront/claims.
+//
 // Endpoints (wired in index.js):
-//   GET  /storefront/catalog            — product catalog + payTo
-//   GET  /storefront/orders             — matched orders
+//   GET  /storefront/catalog            — product catalog + payTo + claims_help
+//   GET  /storefront/orders             — matched orders (incl. legacy-payee orders)
 //   GET  /storefront/claims             — on-chain payments awaiting email/claim
+//   GET  /storefront/legacy-watch       — stranding-watch status + counts
 //   POST /storefront/register           — {tx_or_intent, email} binds an email to a tx/payer
 //   GET  /storefront/scan?secret=...    — cron-friendly manual watcher pass
 //
@@ -22,6 +31,10 @@ const path = require("path");
 const crypto = require("crypto");
 
 const CANONICAL = "0x9b8a27e03ceba490953cda8ab1291c0e13baf72f"; // RAEN treasury (payTo)
+// LEGACY-PAYEE STRANDING WATCH (Staci, 2026-11-22): retired treasury, still
+// served by the facilitator per the KEEP verdict. Full 40-hex from
+// ops/CHARTER wallet records — never a shorthand (homoglyph law).
+const LEGACY_PAYEE = "0x7861db4efc14a1ed5dd8c96c528a3796560f1393";
 const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"; // USDC on Base
 const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const RPCS = [
@@ -91,6 +104,7 @@ function loadState() {
       const s = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
       return {
         cursor: Number(s.cursor) || 0,
+        legacy_cursor: Number(s.legacy_cursor) || 0,
         orders: Array.isArray(s.orders) ? s.orders : [],
         registrations: s.registrations || {},   // key: tx hash (lowercase) or payer addr -> email
         delivered: s.delivered || {},          // tx hash -> {email, sent_at, email_id}
@@ -104,7 +118,7 @@ function loadState() {
       };
     }
   } catch (e) { console.error("storefront restore failed:", e.message); }
-  return { cursor: 0, orders: [], registrations: {}, delivered: {}, subscriptions: {}, subscribers: {}, followups: {}, onboarding: {}, connectors: {}, connectorByEmail: {}, commissions: [] };
+  return { cursor: 0, legacy_cursor: 0, orders: [], registrations: {}, delivered: {}, subscriptions: {}, subscribers: {}, followups: {}, onboarding: {}, connectors: {}, connectorByEmail: {}, commissions: [] };
 }
 
 function makeStore() {
@@ -223,69 +237,104 @@ function matchProduct(amountAtomic) {
 const topicAddr = (addr) => "0x" + addr.toLowerCase().replace(/^0x/, "").padStart(64, "0");
 
 // One watcher pass: scan (cursor, head] in ≤10k-block chunks for USDC transfers
-// to the canonical payTo wallet, match to catalog, store orders.
+// to the canonical payTo wallet, match to catalog, store orders. The same pass
+// also runs the LEGACY-PAYEE STRANDING WATCH (Staci, 2026-11-22): transfers to
+// the retired-but-still-served payee get their own cursor and auto-create an
+// order + claim code, so a buyer whose challenge named the legacy wallet is
+// never stranded invisibly.
 async function scanOnce(store, isInternalPayer, deliverFn, log = console.log) {
   const head = await headNumber();
-  let from = store.state.cursor > 0 ? store.state.cursor + 1 : Math.max(1, head - 100000);
+
+  // Shared per-log pipeline for BOTH payees. payee:"canonical" | "legacy".
+  // Legacy orders ALWAYS get a claim code at creation time — that is the point
+  // of the watch (auto-create order + claim code, so legacy-named settles are
+  // not invisible) — and follow the same match/deliver/claim rules as canonical.
   let scanned = 0, matched = 0;
-  while (from <= head) {
-    const to = Math.min(head, from + MAX_CHUNK - 1);
-    const logs = await withFailover(rpc => rpcCall(rpc, "eth_getLogs", [{
-      address: USDC_BASE,
-      fromBlock: "0x" + from.toString(16),
-      toBlock: "0x" + to.toString(16),
-      topics: [TRANSFER_TOPIC, null, topicAddr(CANONICAL)],
-    }])) || [];
-    for (const lg of logs) {
-      const tx = (lg.transactionHash || "").toLowerCase();
-      if (!tx || store.findOrder(tx)) continue;
-      const payer = "0x" + lg.topics[1].slice(-40);
-      const amountAtomic = BigInt(lg.data).toString();
-      const amountUsd = Number(amountAtomic) / 1e6;
-      const candidates = matchProduct(amountAtomic);
-      const product = candidates.length === 1 ? candidates[0] : null;
-      const order = {
-        tx, block: Number(BigInt(lg.blockNumber)),
-        payer: payer.toLowerCase(),
-        amount_atomic: amountAtomic, amount_usd: amountUsd,
-        product: product ? product.id : null,
-        product_name: product ? product.name : null,
-        matched: candidates.length > 0,
-        ambiguous: candidates.length > 1,
-        candidates: candidates.map(c => c.id),
-        classification: isInternalPayer(payer) ? "internal" : "external",
-        seen_at: Date.now(),
-        delivered: false,
-      };
-      store.addOrder(order);
-      scanned++;
-      if (product) {
-        matched++;
-        log(`storefront: matched ${product.name} ($${product.price_usd}) tx ${tx}`);
-        try { await deliverFn(order, product); } catch (e) {
-          console.error("storefront delivery failed:", e.message, "tx", tx);
-        }
-      } else if (candidates.length > 1) {
-        log(`storefront: $${amountUsd} tx ${tx} ambiguous (${candidates.length} candidates) — trying hint resolution`);
-        try { await deliverFn(order, null); } catch (e) {
-          console.error("storefront hint delivery failed:", e.message, "tx", tx);
-        }
-      } else if (order.classification === "external" && BigInt(amountAtomic) >= CLAIM_MIN_ATOMIC) {
-        // Manual-pay recovery: a real external payment that matches no catalog
-        // price still gets a claim code so its payer can self-serve (register
-        // an email, get a payment-verified credit confirmation). Never silence.
-        log(`storefront: external $${amountUsd} tx ${tx} unmatched to catalog — publishing claim`);
-        try { await deliverFn(order, null); } catch (e) {
-          console.error("storefront claim publish failed:", e.message, "tx", tx);
-        }
+  async function handleLog(lg, payee) {
+    const tx = (lg.transactionHash || "").toLowerCase();
+    if (!tx || store.findOrder(tx)) return;
+    const payer = "0x" + lg.topics[1].slice(-40);
+    const amountAtomic = BigInt(lg.data).toString();
+    const amountUsd = Number(amountAtomic) / 1e6;
+    const candidates = matchProduct(amountAtomic);
+    const product = candidates.length === 1 ? candidates[0] : null;
+    const order = {
+      tx, block: Number(BigInt(lg.blockNumber)),
+      payer: payer.toLowerCase(),
+      payee, // canonical (default for pre-watch orders) | legacy
+      amount_atomic: amountAtomic, amount_usd: amountUsd,
+      product: product ? product.id : null,
+      product_name: product ? product.name : null,
+      matched: candidates.length > 0,
+      ambiguous: candidates.length > 1,
+      candidates: candidates.map(c => c.id),
+      classification: isInternalPayer(payer) ? "internal" : "external",
+      seen_at: Date.now(),
+      delivered: false,
+    };
+    if (payee === "legacy") {
+      // Stranding watch: publish the claim code up-front. The claim code is
+      // derivable from the tx hash anyway (RAEN-<sha256(tx)[:10]>), so this
+      // adds no secret — it only makes the watch VISIBLE in /storefront/claims.
+      order.claim_code = claimCode(order.tx);
+    }
+    store.addOrder(order);
+    scanned++;
+    if (payee === "legacy") {
+      log(`legacy-watch: $${amountUsd} tx ${tx} to retired payee ${LEGACY_PAYEE} — order + claim ${order.claim_code} auto-created`);
+    }
+    if (product) {
+      matched++;
+      log(`storefront: matched ${product.name} ($${product.price_usd}) tx ${tx}${payee === "legacy" ? " (legacy payee)" : ""}`);
+      try { await deliverFn(order, product); } catch (e) {
+        console.error("storefront delivery failed:", e.message, "tx", tx);
+      }
+    } else if (candidates.length > 1) {
+      log(`storefront: $${amountUsd} tx ${tx} ambiguous (${candidates.length} candidates) — trying hint resolution`);
+      try { await deliverFn(order, null); } catch (e) {
+        console.error("storefront hint delivery failed:", e.message, "tx", tx);
+      }
+    } else if (order.classification === "external" && BigInt(amountAtomic) >= CLAIM_MIN_ATOMIC) {
+      // Manual-pay recovery: a real external payment that matches no catalog
+      // price still gets a claim code so its payer can self-serve (register
+      // an email, get a payment-verified credit confirmation). Never silence.
+      log(`storefront: external $${amountUsd} tx ${tx}${payee === "legacy" ? " (legacy payee) " : ""}unmatched to catalog — publishing claim`);
+      try { await deliverFn(order, null); } catch (e) {
+        console.error("storefront claim publish failed:", e.message, "tx", tx);
       }
     }
-    store.state.cursor = to;
-    store.save();
-    from = to + 1;
-    if (head - to > 200000) break; // safety: never chase more than ~200k blocks per pass
   }
-  return { head, scanned, matched, cursor: store.state.cursor };
+
+  async function scanPayee(payeeAddr, cursorField) {
+    let from = store.state[cursorField] > 0 ? store.state[cursorField] + 1 : Math.max(1, head - 100000);
+    while (from <= head) {
+      const to = Math.min(head, from + MAX_CHUNK - 1);
+      const logs = await withFailover(rpc => rpcCall(rpc, "eth_getLogs", [{
+        address: USDC_BASE,
+        fromBlock: "0x" + from.toString(16),
+        toBlock: "0x" + to.toString(16),
+        topics: [TRANSFER_TOPIC, null, topicAddr(payeeAddr)],
+      }])) || [];
+      for (const lg of logs) await handleLog(lg, payeeAddr === CANONICAL ? "canonical" : "legacy");
+      store.state[cursorField] = to;
+      store.save();
+      from = to + 1;
+      if (head - to > 200000) break; // safety: never chase more than ~200k blocks per pass
+    }
+    return store.state[cursorField];
+  }
+
+  const canonicalCursor = await scanPayee(CANONICAL, "cursor");
+  // Stranding watch runs AFTER the canonical pass so a canonical-side failure
+  // (RPC blip) never suppresses the legacy scan in the same pass, and vice versa.
+  let legacyCursor;
+  try {
+    legacyCursor = await scanPayee(LEGACY_PAYEE, "legacy_cursor");
+  } catch (e) {
+    console.error("legacy-watch scan failed (will retry next pass):", e.message);
+    legacyCursor = store.state.legacy_cursor;
+  }
+  return { head, scanned, matched, cursor: canonicalCursor, legacy_cursor: legacyCursor };
 }
 
 // ---------- deliverables ----------
@@ -1283,13 +1332,28 @@ function wireStorefront(app, { isInternalPayer, collectorKey }) {
   if (iv.unref) iv.unref();
 
   app.get("/storefront/catalog", (_req, res) =>
-    res.json({ pay_to: CANONICAL, network: "base", token: "USDC", usdc_contract: USDC_BASE, products: CATALOG }));
+    res.json({
+      pay_to: CANONICAL, network: "base", token: "USDC", usdc_contract: USDC_BASE, products: CATALOG,
+      // CLAIMS DISCOVERABILITY (Staci, 2026-11-22): every machine-facing surface
+      // carries the claims desk + tx-lookup instructions, so a stranded buyer
+      // who paid but got nothing always finds the self-serve path here.
+      claims_help: {
+        paid_but_nothing_delivered: "If you paid USDC but received nothing, do not pay again.",
+        lookup_your_payment: "GET /storefront/claims?tx=<your tx hash>  OR  GET /storefront/claims?payer=<your wallet address>",
+        claim_code_note: "Your claim code is derivable from your tx: RAEN-<sha256(tx)[:10] uppercase> — lookup confirms it.",
+        register_for_delivery: "POST /storefront/register {tx_or_intent: <tx or payer address>, email: <you> | callback_url: <https machine endpoint>, product?: <catalog id>}",
+        credits_verify: "GET /storefront/credits/<claim code> — verify a prepaid credit (one-time redeem: POST /storefront/credits/<code>/redeem)",
+        legacy_payee_watch: "Transfers to the retired treasury 0x7861db4efc14a1ed5dd8c96c528a3796560f1393 are ALSO tracked (auto order + claim code) — see /storefront/legacy-watch",
+        contact: "ops@royalruby.io",
+      },
+    }));
 
   app.get("/storefront/deliveries", (_req, res) => res.json({ deliveries: store.state.delivered }));
 
   app.get("/storefront/orders", (_req, res) => {
     const orders = store.state.orders.slice().reverse().slice(-200).map(o => ({
       ...o,
+      payee: o.payee || "canonical", // pre-watch orders are canonical by construction
       email: o.email || (store.lookupEmail(o) || null),
     }));
     res.json({ total_orders: store.state.orders.length, matched: store.state.orders.filter(o => o.matched).length, orders });
@@ -1325,7 +1389,9 @@ function wireStorefront(app, { isInternalPayer, collectorKey }) {
           : claimable ? "open"
           : "recorded";
         return {
-          tx: o.tx, block: o.block || null, payer: o.payer, amount_usd: o.amount_usd,
+          tx: o.tx, block: o.block || null, payer: o.payer,
+          payee: o.payee || "canonical",
+          amount_usd: o.amount_usd,
           product: o.product || null, product_name: o.product_name || null,
           claim_code: o.claim_code || (claimable ? claimCode(o.tx) : null),
           matched: Boolean(o.matched), ambiguous: Boolean(o.ambiguous),
@@ -1342,17 +1408,47 @@ function wireStorefront(app, { isInternalPayer, collectorKey }) {
         note: "open claim? register at /storefront/register with your tx hash (or payer address) + email, or callback_url for machine delivery. redeemed credits are one-time.",
         resolve_url: "https://settlement-collector.fly.dev/storefront/register",
         credits_verify_url: "https://settlement-collector.fly.dev/storefront/credits/<code>",
+        legacy_payee_watch: "transfers to the retired payee 0x7861db4efc14a1ed5dd8c96c528a3796560f1393 are tracked too — if your challenge named that wallet, your payment is still here; this lookup finds it.",
       });
     }
     const claims = store.state.orders
       .filter(o => (o.matched || o.claim_code) && !o.delivered && !o.credit_recorded && !store.lookupEmail(o))
       .map(o => ({
         tx: o.tx, product: o.product_name, amount_usd: o.amount_usd, payer: o.payer,
+        payee: o.payee || "canonical",
         claim_code: o.claim_code, ambiguous: Boolean(o.ambiguous), candidates: o.candidates || [],
         seen_at: o.seen_at,
       }))
       .reverse();
-    res.json({ open_claims: claims.length, claims, resolve_url: "https://settlement-collector.fly.dev/storefront/register" });
+    res.json({
+      open_claims: claims.length, claims, resolve_url: "https://settlement-collector.fly.dev/storefront/register",
+      lookup_hint: "have a tx hash or wallet address? GET /storefront/claims?tx=… or ?payer=… for your specific payment",
+      legacy_payee_watch: "retired-payee transfers are watched too — status at /storefront/legacy-watch",
+    });
+  });
+
+  // LEGACY-PAYEE STRANDING WATCH status (Staci, 2026-11-22): public, honest
+  // counts. The watch is live when legacy_cursor advances with the chain head;
+  // zero orders is an honest zero (no transfers to the retired payee in the
+  // scanned window), never a silent watcher.
+  app.get("/storefront/legacy-watch", (_req, res) => {
+    const legacyOrders = store.state.orders.filter(o => o.payee === "legacy");
+    const last = legacyOrders.length ? legacyOrders[legacyOrders.length - 1] : null;
+    res.json({
+      payee: LEGACY_PAYEE,
+      status: "watching",
+      what: "USDC transfers to this retired-but-still-served payee auto-create an order + claim code (RAEN-<sha256(tx)[:10]>) so legacy-named settles are never invisible",
+      cursor: store.state.legacy_cursor,
+      watch_orders: legacyOrders.length,
+      last_order: last ? {
+        tx: last.tx, payer: last.payer, amount_usd: last.amount_usd,
+        claim_code: last.claim_code, matched: Boolean(last.matched),
+        delivered: Boolean(last.delivered), seen_at: last.seen_at,
+      } : null,
+      claims_url: "https://settlement-collector.fly.dev/storefront/claims",
+      register_url: "https://settlement-collector.fly.dev/storefront/register",
+      note: "zero orders = no transfers to the retired payee in the scanned window (honest zero). Lookup by tx/payer at /storefront/claims.",
+    });
   });
 
   // POST /storefront/register {tx_or_intent, email, product?, ref?}
