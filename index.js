@@ -208,6 +208,66 @@ app.get("/stats", (_req, res) => {
 app.get("/failures", (_req, res) => {
   res.json(events.filter(e => e.event === "failed" || (e.event === "challenge" && e.status >= 500)).slice(-100).reverse());
 });
+
+// ---- DEMAND MINING (Bean, Nov 16): classify failed challenges by error_class x route ----
+// A "failed challenge" is event=failed, or a challenge that answered >=500 (http_500 on a
+// paid path). output: machine-readable demand report — per route: failures_7d,
+// class_breakdown, per-day trend, interpretation.
+function classifyEvents(list) {
+  const byRoute = {};
+  for (const e of list) {
+    const key = `${e.service} ${e.route || "(root)"}`;
+    const r = (byRoute[key] ||= { service: e.service, route: e.route || "(root)", counts: {}, days: {} });
+    const ec = e.error_class || (e.status >= 500 ? `http_${e.status}` : e.status ? `http_${e.status}` : "unclassified");
+    r.counts[ec] = (r.counts[ec] || 0) + 1;
+    const day = new Date(e.ts).toISOString().slice(0, 10);
+    r.days[day] = (r.days[day] || 0) + 1;
+  }
+  const now = Date.now();
+  const day1 = now - 86400000;
+  const out = [];
+  for (const r of Object.values(byRoute)) {
+    const f24 = Object.entries(r.days)
+      .filter(([d]) => new Date(`${d}T00:00:00Z`).getTime() >= day1)
+      .reduce((s, [, n]) => s + n, 0);
+    const breakdown = {};
+    for (const [k, v] of Object.entries(r.counts)) breakdown[k] = v;
+    let interpretation = "normal — monitor";
+    if (breakdown.client_abort > 5) interpretation = "TIMEOUT PROBLEM: buyers give up waiting — check handler latency/LLM timeout on this route";
+    if (breakdown.http_404 > 10) interpretation = "DOC/ROUTE MISMATCH: docs point at a route that 404s — fix docs or add the route";
+    if (breakdown.http_500 > 0) interpretation = "P0: 500s on a paid path — real buyers hitting server errors";
+    out.push({
+      service: r.service, route: r.route,
+      failures_7d: Object.values(r.counts).reduce((s, n) => s + n, 0),
+      failures_24h: f24,
+      class_breakdown: breakdown,
+      trend_daily: r.days,
+      interpretation,
+    });
+  }
+  return out.sort((a, b) => b.failures_7d - a.failures_7d);
+}
+
+app.get("/stats/classify", (_req, res) => {
+  const days = Math.min(Number(_req.query.days) || 7, 90);
+  const since = Date.now() - days * 86400000;
+  const win = events.filter(e => e.ts >= since);
+  const failed = win.filter(e => e.event === "failed" || (e.event === "challenge" && e.status >= 500));
+  const routes = classifyEvents(failed);
+  const flags = {
+    timeout_routes: routes.filter(r => r.class_breakdown.client_abort > 5).map(r => ({ service: r.service, route: r.route, client_aborts_24h: r.failures_24h })),
+    notfound_routes: routes.filter(r => r.class_breakdown.http_404 > 10).map(r => ({ service: r.service, route: r.route, count_7d: r.class_breakdown.http_404 })),
+    p0_paid_500s: routes.filter(r => r.class_breakdown.http_500 > 0).map(r => ({ service: r.service, route: r.route, count_7d: r.class_breakdown.http_500 })),
+  };
+  res.json({
+    generated_at: new Date().toISOString(),
+    window_days: days,
+    total_challenges_7d: win.filter(e => e.event === "challenge").length,
+    total_failures_7d: failed.length,
+    flags,
+    routes,
+  });
+});
 // ---- client value-ledger reports (retention weapon, REVENUE-STRATEGY-V2) ----
 const valueConfig = loadConfig();
 
@@ -408,7 +468,43 @@ const certifyRoute = {
     "Signed machine-readable compliance certificate for a fleet service: manifest sha256, live 402-quote validity, health probe, last tx-verified settlement evidence, delivery counts, open-claim count. $0.01 per check, Base USDC x402.",
   mimeType: "application/json",
 };
+// MACHINE-VOLUME TIER (Bean, Nov 16): GET /certify/bulk?services=a,b,c,...
+// $0.002/check, minimum 10 services = $0.02/call (requests below 10 still bill
+// the 10-service minimum). Built for indexer-crawlers that map the whole
+// ecosystem in one call instead of N one-shot $0.01 checks.
+const BULK_PER_CHECK_USD = 0.002;
+const BULK_MIN_SERVICES = 10;
+const BULK_MAX_SERVICES = 100;
+function parseBulkServices(raw) {
+  const arr = Array.isArray(raw) ? raw : String(raw || "").split(",");
+  return [...new Set(arr.map((s) => String(s).trim().toLowerCase()).filter(Boolean))].slice(0, BULK_MAX_SERVICES);
+}
+function bulkCertifyPrice(context) {
+  try {
+    const raw = context?.adapter?.getQueryParam?.("services") ?? (String(context?.path || "").match(/[?&]services=([^&]*)/) || [])[1];
+    const n = parseBulkServices(raw).length;
+    const count = Math.min(Math.max(n, BULK_MIN_SERVICES), BULK_MAX_SERVICES);
+    return "$" + (count * BULK_PER_CHECK_USD).toFixed(3);
+  } catch {
+    return "$" + (BULK_MIN_SERVICES * BULK_PER_CHECK_USD).toFixed(3);
+  }
+}
+const bulkRoute = {
+  accepts: {
+    scheme: "exact",
+    price: bulkCertifyPrice, // dynamic: services count x $0.002, min 10
+    network: CERTIFY_NETWORK,
+    payTo: CERTIFY_PAY_TO,
+    extra: { facilitator: CERTIFY_FACILITATOR },
+  },
+  serviceName: "raen-compliance-feed",
+  description:
+    "Bulk signed compliance certificates for a list of fleet services: GET /certify/bulk?services=a,b,c,... $0.002 per check, minimum 10 services ($0.02/call), max 100. Same signed certificate payload as the single-check endpoint. Base USDC x402.",
+  mimeType: "application/json",
+};
 const certifyGateRoutes = {
+  "GET /certify/bulk": bulkRoute,
+  "* /certify/bulk": bulkRoute,
   "GET /certify/:service": certifyRoute,
   "* /certify/:service": certifyRoute, // Bazaar validate_endpoint probes GET/HEAD too
 };
@@ -435,6 +531,14 @@ app.get("/certify", (_req, res) => {
     product: "RAEN Compliance Feed",
     version: "raen-compliance-feed/v1",
     price: CERTIFY_PRICE,
+    volume_tier: {
+      endpoint: "GET /certify/bulk?services=a,b,c,...",
+      price_per_check_usd: BULK_PER_CHECK_USD,
+      min_services: BULK_MIN_SERVICES,
+      min_call_usd: BULK_MIN_SERVICES * BULK_PER_CHECK_USD,
+      max_services: BULK_MAX_SERVICES,
+      note: "dynamic challenge price = service count x $0.002, floor 10 services ($0.02/call). Built for indexer-crawlers mapping the whole fleet in one call.",
+    },
     network: CERTIFY_NETWORK,
     pay_to: CERTIFY_PAY_TO,
     facilitator: CERTIFY_FACILITATOR,
@@ -455,8 +559,76 @@ app.get("/certify/.well-known/pubkey.json", (_req, res) => {
   res.json({ algorithm: "Ed25519", public_key_pem: certSignKeys.public_key_pem, key_created_at: certSignKeys.created_at });
 });
 
-// PAID: the certificate itself (challenge/settlement handled by the middleware above)
+// shared certificate build (single + bulk) — probe, assemble, sign
+async function buildSignedCert(svc) {
+  const names = FLEET;
+  const [health, manifestProbe] = await Promise.all([
+    probe(`https://${svc}.fly.dev/health`),
+    probeManifestAndQuote(svc),
+  ]);
+  const parts = buildCertificate(svc, events, storefrontStore, names);
+  const payload = await assembleCertificate(parts, { health, manifestProbe });
+  const signature = crypto.sign(null, Buffer.from(canonicalJson(payload), "utf8"), certSignKeys.private_key_pem);
+  return { ...payload, signature: signature.toString("base64"), signing_key_id: "settlement-collector-certify-v1", verify: "/certify/.well-known/pubkey.pem" };
+}
+function recordCertifySettle(route, price_usd, req) {
+  try {
+    const payHdr = req.get("payment-signature") || req.get("x-payment");
+    let payer = null, tx = null;
+    if (payHdr) {
+      let p = null;
+      try { p = JSON.parse(payHdr); } catch (e) { p = JSON.parse(Buffer.from(payHdr, "base64").toString("utf8")); }
+      payer = (p.from || p.payer || null) || null;
+      tx = p.transaction || p.transactionHash || (p.payload && p.payload.transaction) || null;
+    }
+    const ev = { service: "settlement-collector", event: "settled", route, price_usd, status: 200, error_class: "", latency_ms: 0, tx: tx || "", payer: payer || "", ts: Date.now() };
+    events.push(ev);
+    persist(ev);
+  } catch (e) {
+    // telemetry must never break delivery — record an unattributed settle
+    try {
+      const ev = { service: "settlement-collector", event: "settled", route, price_usd, status: 200, error_class: "", latency_ms: 0, tx: "", payer: "", ts: Date.now() };
+      events.push(ev);
+      persist(ev);
+    } catch (_e2) { /* nothing more we can do */ }
+  }
+}
+
+// PAID: bulk certificates (challenge/settlement handled by the middleware above)
 app.use(certifyPayment);
+app.get("/certify/bulk", async (req, res) => {
+  const services = parseBulkServices(req.query.services);
+  if (services.length === 0) {
+    return res.status(400).json({ ok: false, error: "services query param required: ?services=a,b,c,...", known_services: FLEET, pricing: `$${BULK_PER_CHECK_USD}/check, min ${BULK_MIN_SERVICES} services = $${(BULK_MIN_SERVICES * BULK_PER_CHECK_USD).toFixed(2)}/call, max ${BULK_MAX_SERVICES}` });
+  }
+  const billed = Math.min(Math.max(services.length, BULK_MIN_SERVICES), BULK_MAX_SERVICES);
+  const price_usd = billed * BULK_PER_CHECK_USD;
+  const unknown = services.filter((s) => !FLEET.includes(s));
+  const certs = {};
+  const failures = {};
+  for (const svc of services.filter((s) => FLEET.includes(s))) {
+    const cacheKey = `cert:${svc}`;
+    const cached = certifyCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < Number(process.env.CERTIFY_CACHE_TTL_MS || 30000)) { certs[svc] = cached.cert; continue; }
+    try {
+      certs[svc] = await buildSignedCert(svc);
+      certifyCache.set(cacheKey, { at: Date.now(), cert: certs[svc] });
+    } catch (e) {
+      failures[svc] = "certificate build failed";
+    }
+  }
+  recordCertifySettle("/certify/bulk", price_usd, req);
+  res.json({
+    ok: true,
+    billed_services: billed,
+    price_usd,
+    per_check_usd: BULK_PER_CHECK_USD,
+    certificates: certs,
+    failures,
+    unknown_services: unknown,
+  });
+});
+
 app.get("/certify/:service", async (req, res) => {
   const svc = String(req.params.service || "").toLowerCase();
   const names = FLEET;
@@ -469,39 +641,9 @@ app.get("/certify/:service", async (req, res) => {
     return res.json(cached.cert);
   }
   try {
-    const [health, manifestProbe] = await Promise.all([
-      probe(`https://${svc}.fly.dev/health`),
-      probeManifestAndQuote(svc),
-    ]);
-    const parts = buildCertificate(svc, events, storefrontStore, names);
-    const payload = await assembleCertificate(parts, { health, manifestProbe });
-    const signature = crypto.sign(null, Buffer.from(canonicalJson(payload), "utf8"), certSignKeys.private_key_pem);
-    const cert = { ...payload, signature: signature.toString("base64"), signing_key_id: "settlement-collector-certify-v1", verify: "/certify/.well-known/pubkey.pem" };
+    const cert = await buildSignedCert(svc);
     certifyCache.set(cacheKey, { at: Date.now(), cert });
-    // settle telemetry: this request PAID (the middleware above settled it before
-    // we ran). Extract payer/tx from the PAYMENT-SIGNATURE payload when parseable;
-    // without a parseable tx the event stays tx-less and counts as unverified
-    // revenue per the TRUTH law — never inflate it.
-    try {
-      const payHdr = req.get("payment-signature") || req.get("x-payment");
-      let payer = null, tx = null;
-      if (payHdr) {
-        let p = null;
-        try { p = JSON.parse(payHdr); } catch (e) { p = JSON.parse(Buffer.from(payHdr, "base64").toString("utf8")); }
-        payer = (p.from || p.payer || null) || null;
-        tx = p.transaction || p.transactionHash || (p.payload && p.payload.transaction) || null;
-      }
-      const ev = { service: "settlement-collector", event: "settled", route: "/certify/" + svc, price_usd: 0.01, status: 200, error_class: "", latency_ms: 0, tx: tx || "", payer: payer || "", ts: Date.now() };
-      events.push(ev);
-      persist(ev);
-    } catch (e) {
-      // telemetry must never break delivery — record an unattributed settle
-      try {
-        const ev = { service: "settlement-collector", event: "settled", route: "/certify/" + svc, price_usd: 0.01, status: 200, error_class: "", latency_ms: 0, tx: "", payer: "", ts: Date.now() };
-        events.push(ev);
-        persist(ev);
-      } catch (_e2) { /* nothing more we can do */ }
-    }
+    recordCertifySettle("/certify/" + svc, 0.01, req);
     res.json(cert);
   } catch (e) {
     console.error("certify build failed:", e.message);
