@@ -147,7 +147,7 @@ app.post("/events", (req, res) => {
   if (!b.service || !b.event) return res.status(400).json({ error: "service and event required" });
   const ev = {
     service: String(b.service).slice(0, 64),
-    event: String(b.event).slice(0, 32),        // challenge | settled | failed | retry
+    event: String(b.event).slice(0, 32),        // challenge | settled | settled-unverified | delivery | failed | retry
     route: String(b.route || "").slice(0, 128),
     price_usd: Number(b.price_usd) || 0,
     status: Number(b.status) || 0,
@@ -155,11 +155,18 @@ app.post("/events", (req, res) => {
     latency_ms: Number(b.latency_ms) || 0,
     tx: String(b.tx || "").slice(0, 80),
     payer: String(b.payer || "").slice(0, 64),
+    product_digest: String(b.product_digest || "").slice(0, 128), // claims delivery-binding (Staci, 2026-11-24): sha256 of delivered payload bytes
     ts: Date.now(),
   };
   events.push(ev);
   if (events.length > MAX_EVENTS) events = events.slice(-MAX_EVENTS);
   persist(ev);
+  // CLAIMS DELIVERY-BINDING (Staci, 2026-11-24): a tx-bearing settled/delivery
+  // event from a SERVICE's own route is delivery evidence — hand it to the
+  // storefront binder, which matches it to the watcher order by tx (facilitator
+  // routes are filtered there: they prove payment, not product delivery).
+  try { if (storefrontStore && storefrontStore.recordDeliveryEvidence) storefrontStore.recordDeliveryEvidence(ev); }
+  catch (e) { console.error("delivery-evidence hook failed:", e.message); }
   res.json({ ok: true });
 });
 
@@ -524,6 +531,24 @@ const certifyPayment = paymentMiddleware(certifyGateRoutes, certifyX402Server, u
 // store the storefront store handle for open-claim counts (wireStorefront returns its store)
 const storefrontStore = wireStorefront(app, { isInternalPayer, collectorKey: COLLECTOR_KEY });
 wireClearing(app, () => events);
+
+// CLAIMS DELIVERY-BINDING backfill (Staci, 2026-11-24): re-bind tx-bearing
+// settled/delivery telemetry from the restored events log so HISTORICAL
+// delivered orders — buyers who paid AND received product but showed
+// delivered:false at the claims desk (the P1) — become machine-distinguishable
+// from stranded ones too. Same trust rule as live ingest: only a SERVICE's own
+// key-gated route telemetry flips delivered (facilitator routes filtered).
+try {
+  let boundCount = 0;
+  for (const ev of events) {
+    if ((ev.event === "settled" || ev.event === "delivery") && ev.tx) {
+      const before = storefrontStore.findOrder(ev.tx);
+      const bound = storefrontStore.recordDeliveryEvidence(ev);
+      if (bound && before && !before.delivered) boundCount++;
+    }
+  }
+  if (boundCount) console.log(`[delivery-binding] backfill: ${boundCount} historical orders bound from telemetry evidence`);
+} catch (e) { console.error("delivery-binding backfill failed:", e.message); }
 
 // FREE discovery: what this is + how to pay + how to verify signatures
 app.get("/certify", (_req, res) => {

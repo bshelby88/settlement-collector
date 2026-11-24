@@ -115,10 +115,11 @@ function loadState() {
         connectors: s.connectors || {},        // code -> {name,email,audience,rate,created_at}
         connectorByEmail: s.connectorByEmail || {}, // email(lower) -> code
         commissions: s.commissions || [],      // {tx, connector, order_usd, commission_usd, at}
+        delivery_evidence: s.delivery_evidence || {}, // tx(lower) -> claims delivery-binding evidence (Staci, 2026-11-24)
       };
     }
   } catch (e) { console.error("storefront restore failed:", e.message); }
-  return { cursor: 0, legacy_cursor: 0, orders: [], registrations: {}, delivered: {}, subscriptions: {}, subscribers: {}, followups: {}, onboarding: {}, connectors: {}, connectorByEmail: {}, commissions: [] };
+  return { cursor: 0, legacy_cursor: 0, orders: [], registrations: {}, delivered: {}, subscriptions: {}, subscribers: {}, followups: {}, onboarding: {}, connectors: {}, connectorByEmail: {}, commissions: [], delivery_evidence: {} };
 }
 
 function makeStore() {
@@ -236,6 +237,90 @@ function matchProduct(amountAtomic) {
 
 const topicAddr = (addr) => "0x" + addr.toLowerCase().replace(/^0x/, "").padStart(64, "0");
 
+// ---------- CLAIMS DELIVERY-BINDING (Staci, 2026-11-24) — the P1 fix ----------
+// A buyer who paid AND received product used to show matched:false,
+// delivered:false, product:null at the claims desk (state "recorded") —
+// indistinguishable from a stranded payment. Root cause: delivery flags came
+// from receipt metadata/webhook acks, never from product proof.
+//
+// Delivery evidence model (TRUTH law — no delivery claim without verified
+// evidence; the SERVICE's own key-gated telemetry is the only thing that flips
+// delivered:false → true):
+//   1. "settled" telemetry events (deployed settlement-telemetry middleware):
+//      a paid request completed 2xx on the service's OWN route with the on-chain
+//      tx decoded from the settlement receipt — the service that returned the
+//      product attests the paid 200 for that exact tx. Facilitator routes
+//      (/settle, /verify, /facilitator*) prove PAYMENT, not delivery — excluded.
+//   2. "delivery" telemetry events (middleware addition staged in
+//      RAEN/x402/settlement-telemetry.cjs): same attestation plus
+//      product_digest = sha256 of the payload bytes actually sent.
+//   3. POST /storefront/delivery-digest — buyer-presented sha256 of the payload
+//      it actually received for a tx it paid. Attaches a digest to the evidence
+//      record (and to a bound order); NEVER creates delivery state by itself.
+// Binding: evidence matches the watcher order by tx → matched:true (the payment
+// matched the paid route that delivered it), delivered:true, product = route id,
+// product_digest recorded. Claims lookups then show honest, machine-readable
+// delivery state with the payload proof.
+const FACILITATOR_SERVICES = new Set(["raen-facilitator", "raen-facilitator-worker"]);
+function isDeliveryRouteEvidence(service, route) {
+  if (FACILITATOR_SERVICES.has(String(service || "").toLowerCase())) return false;
+  const r = String(route || "");
+  return !(r === "/settle" || r === "/verify" || r.startsWith("/facilitator") || r.startsWith("facilitator"));
+}
+function bindOrderFromEvidence(order, evd, log = console.log) {
+  order.matched = true; // the payment matched the paid route that delivered it
+  order.delivered = true;
+  order.product = `route:${evd.service}:${evd.route || "(route)"}`;
+  order.product_name = `Route delivery — ${evd.service} ${evd.route || ""} (service-attested paid 2xx, tx-verified)`;
+  order.product_digest = evd.product_digest || order.product_digest || null;
+  order.delivery_evidence = {
+    source: "service-telemetry",
+    service: evd.service || null,
+    route: evd.route || null,
+    tx: order.tx,
+    product_digest: order.product_digest,
+    digest_source: evd.digest_source || null,
+    at: Date.now(),
+  };
+  return order;
+}
+function upsertDeliveryEvidence(store, { service, route, price_usd, payer, tx, product_digest, digest_source, service_attested }) {
+  const key = String(tx || "").toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(key)) return null;
+  const st = store.state;
+  if (!st.delivery_evidence) st.delivery_evidence = {};
+  const cur = st.delivery_evidence[key] || {
+    service: null, route: null, price_usd: null, payer: null,
+    product_digest: null, digest_source: null, service_attested: false,
+    first_at: Date.now(), events: [],
+  };
+  const evd = {
+    ...cur,
+    tx: key,
+    ...(service_attested ? { service, route, price_usd, payer, service_attested: true } : {}),
+    ...(product_digest ? { product_digest, digest_source: digest_source || cur.digest_source || "buyer-presented" } : {}),
+  };
+  evd.events = [...(cur.events || []), { service_attested: Boolean(service_attested), digest_source: digest_source || null, at: Date.now() }].slice(-10);
+  st.delivery_evidence[key] = evd;
+  const keys = Object.keys(st.delivery_evidence);
+  if (keys.length > 5000) for (const k of keys.slice(0, keys.length - 5000)) delete st.delivery_evidence[k];
+  const order = store.findOrder(key);
+  if (order) {
+    if (evd.service_attested && !order.delivered) {
+      bindOrderFromEvidence(order, evd);
+      store.markDelivered(order.tx, { kind: "route-delivery", service: evd.service, route: evd.route || null, digest: evd.product_digest || null, sent_at: Date.now(), email: null });
+      console.log("[storefront] delivery-binding: tx", order.tx, "→ delivered via", evd.service, evd.route || "");
+    } else if (evd.product_digest && order.delivered && !order.product_digest) {
+      order.product_digest = evd.product_digest;
+      if (order.delivery_evidence) order.delivery_evidence.product_digest = evd.product_digest;
+      const rec = st.delivered[order.tx]; if (rec) rec.digest = evd.product_digest;
+    }
+  }
+  store.save();
+  return evd;
+}
+
+
 // One watcher pass: scan (cursor, head] in ≤10k-block chunks for USDC transfers
 // to the canonical payTo wallet, match to catalog, store orders. The same pass
 // also runs the LEGACY-PAYEE STRANDING WATCH (Staci, 2026-11-22): transfers to
@@ -278,12 +363,26 @@ async function scanOnce(store, isInternalPayer, deliverFn, log = console.log) {
       // adds no secret — it only makes the watch VISIBLE in /storefront/claims.
       order.claim_code = claimCode(order.tx);
     }
+    // CLAIMS DELIVERY-BINDING (Staci, 2026-11-24): if the fleet service's own
+    // key-gated telemetry already attested a paid 2xx for this exact tx
+    // (settled/delivery event ingested via /events), bind it now — this is what
+    // makes a delivered order machine-distinguishable from a stranded one.
+    // A buyer-presented digest alone (service_attested:false) records the
+    // payload proof but NEVER flips delivered (TRUTH law).
+    const evd = (store.state.delivery_evidence || {})[tx];
+    const routeDelivered = Boolean(evd && evd.service_attested);
+    if (evd && evd.product_digest && !routeDelivered) order.product_digest = evd.product_digest;
+    if (routeDelivered) bindOrderFromEvidence(order, evd, log);
     store.addOrder(order);
     scanned++;
     if (payee === "legacy") {
       log(`legacy-watch: $${amountUsd} tx ${tx} to retired payee ${LEGACY_PAYEE} — order + claim ${order.claim_code} auto-created`);
     }
-    if (product) {
+    if (routeDelivered) {
+      // delivered on the service's own paid route — no email/webhook pipeline
+      store.markDelivered(order.tx, { kind: "route-delivery", service: evd.service, route: evd.route || null, digest: evd.product_digest || null, sent_at: Date.now(), email: null });
+      log(`storefront: tx ${tx} DELIVERED via ${evd.service} ${evd.route || ""} (service-attested route delivery, $${amountUsd})`);
+    } else if (product) {
       matched++;
       log(`storefront: matched ${product.name} ($${product.price_usd}) tx ${tx}${payee === "legacy" ? " (legacy payee)" : ""}`);
       try { await deliverFn(order, product); } catch (e) {
@@ -1213,6 +1312,34 @@ function wireStorefront(app, { isInternalPayer, collectorKey }) {
     }
   }
 
+  // CLAIMS DELIVERY-BINDING (Staci, 2026-11-24): the /events ingest hands every
+  // tx-bearing settled/delivery event here. Service-side telemetry (key-gated)
+  // on a SERVICE's own route = delivery evidence; facilitator telemetry and
+  // buyer-presented data never flip delivered (TRUTH law). See the module-level
+  // delivery-binding block for the evidence model.
+  function recordDeliveryEvidence(ev) {
+    try {
+      if (!ev || !ev.tx) return null;
+      const et = String(ev.event || "");
+      if (et !== "settled" && et !== "delivery") return null;
+      const service = String(ev.service || "").toLowerCase();
+      if (!isDeliveryRouteEvidence(service, ev.route)) return null; // facilitator routes prove payment, not delivery
+      if (et === "settled" && Number(ev.status) >= 400) return null; // a failed "settled" never binds
+      return upsertDeliveryEvidence(store, {
+        service, route: String(ev.route || ""), price_usd: Number(ev.price_usd) || null,
+        payer: ev.payer ? String(ev.payer).toLowerCase() : null, tx: ev.tx,
+        product_digest: ev.product_digest || null,
+        digest_source: et === "delivery" ? "service-telemetry" : null,
+        service_attested: true,
+      });
+    } catch (e) {
+      console.error("[storefront] delivery-evidence ingest failed:", e.message);
+      return null;
+    }
+  }
+  store.recordDeliveryEvidence = recordDeliveryEvidence;
+
+
   // Manual-pay recovery backfill (Bean, Nov 15): external orders already seen
   // before this feature get claim codes so their payers can self-serve too.
   // Dust below the claim floor (scatter transfers) is excluded.
@@ -1393,10 +1520,12 @@ function wireStorefront(app, { isInternalPayer, collectorKey }) {
           payee: o.payee || "canonical",
           amount_usd: o.amount_usd,
           product: o.product || null, product_name: o.product_name || null,
+          product_digest: o.product_digest || null, // claims delivery-binding (Staci, 2026-11-24)
+          delivery_evidence: o.delivery_evidence || null, // {source,service,route,product_digest,digest_source,at}
           claim_code: o.claim_code || (claimable ? claimCode(o.tx) : null),
           matched: Boolean(o.matched), ambiguous: Boolean(o.ambiguous),
           delivered: Boolean(o.delivered),
-          delivery_channel: rec ? (rec.channel || (rec.kind === "credit-confirmation" ? "credit-confirmation" : "email")) : (o.delivered ? "email" : null),
+          delivery_channel: rec ? (rec.channel || (rec.kind === "route-delivery" ? "route-delivery" : (rec.kind === "credit-confirmation" ? "credit-confirmation" : "email"))) : (o.delivered ? "email" : null),
           credit_redeemed: Boolean(o.credit_redeemed),
           registered: Boolean(store.lookupEmail(o) || (store.lookupRegistration(o) || {}).callback_url),
           state, seen_at: o.seen_at,
@@ -1424,6 +1553,38 @@ function wireStorefront(app, { isInternalPayer, collectorKey }) {
       open_claims: claims.length, claims, resolve_url: "https://settlement-collector.fly.dev/storefront/register",
       lookup_hint: "have a tx hash or wallet address? GET /storefront/claims?tx=… or ?payer=… for your specific payment",
       legacy_payee_watch: "retired-payee transfers are watched too — status at /storefront/legacy-watch",
+    });
+  });
+
+  // POST /storefront/delivery-digest — buyer-presented delivery receipt
+  // (CLAIMS DELIVERY-BINDING, Staci 2026-11-24). The buyer (or any machine that
+  // received the payload) presents the sha256 of the delivered bytes for a tx
+  // it paid. TRUTH: this NEVER sets delivered:true by itself — it attaches the
+  // payload proof to the delivery-evidence record; delivery flips only when the
+  // service's own key-gated telemetry attests the paid 2xx for that tx.
+  app.post("/storefront/delivery-digest", (req, res) => {
+    if (!lookupRateLimit(req)) return res.status(429).json({ error: "rate limit — slow down" });
+    const b = req.body || {};
+    const tx = String(b.tx || "").trim().toLowerCase();
+    const rawDigest = String(b.product_digest || "").trim().toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(tx))
+      return res.status(400).json({ error: "tx must be a 0x-prefixed 32-byte hash" });
+    const digestHex = rawDigest.startsWith("sha256:") ? rawDigest.slice(7) : rawDigest;
+    if (!/^[0-9a-f]{64}$/.test(digestHex))
+      return res.status(400).json({ error: "product_digest must be a sha256 hex digest (64 hex chars, optional sha256: prefix)" });
+    const product_digest = "sha256:" + digestHex;
+    const trusted = Boolean(collectorKey && req.get("x-collector-key") === collectorKey);
+    const evd = upsertDeliveryEvidence(store, {
+      tx, product_digest,
+      digest_source: trusted ? "service-telemetry" : "buyer-presented",
+      service_attested: false,
+    });
+    const order = store.findOrder(tx);
+    res.json({
+      ok: true, tx, product_digest,
+      service_attested: Boolean(evd && evd.service_attested),
+      delivery_state: order ? (order.delivered ? "delivered" : "recorded-awaiting-service-attestation") : "no-order-yet",
+      note: "digest recorded. delivered flips only on the service's own key-gated telemetry (paid 2xx with this tx) — a buyer-presented digest alone never marks delivery.",
     });
   });
 
