@@ -19,6 +19,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { settledAmount } = require("./chain-truth"); // chain = money truth (CROWN 2026-11-26)
 
 const CANONICAL_PAY_TO = "0x9b8a27e03ceba490953cda8ab1291c0e13baf72f";
 const KEY_FILE = path.join(process.env.CERTIFY_KEY_FILE_DIR || "/data", "cert-signing-key.json");
@@ -184,7 +185,7 @@ async function assembleCertificate(parts, probeResults) {
       ? {
           tx: lastSettle.tx,
           payer: lastSettle.payer || null,
-          amount_usd: r4(lastSettle.price_usd || 0),
+          amount_usd: r4(settledAmount(lastSettle)),
           settled_at: new Date(lastSettle.ts).toISOString(),
           tx_verified: true,
         }

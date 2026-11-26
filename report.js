@@ -4,6 +4,7 @@
 // Reads config from env VALUE_CONFIG, then ../ops/value-config.json, then ./value-config.json.
 const fs = require("fs");
 const path = require("path");
+const { settledAmount } = require("./chain-truth"); // chain = money truth (CROWN 2026-11-26)
 
 function loadConfig() {
   const candidates = [
@@ -49,7 +50,7 @@ function buildReport(events, config, client, period = "week") {
     const r = (rows[key] ||= { date: day, service: e.service, calls: 0, settlements: 0, revenue_usd: 0, last_ts: 0 });
     r.calls += 1;
     r.settlements += 1;
-    r.revenue_usd += e.price_usd || 0;
+    r.revenue_usd += settledAmount(e);
     if (e.ts > r.last_ts) r.last_ts = e.ts;
   }
   const out = Object.values(rows).map(r => {

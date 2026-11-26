@@ -17,6 +17,9 @@ const {
 const { loadConfig, buildReport, renderHtml, sendViaResend } = require("./report");
 const { wireStorefront } = require("./storefront");
 const { wireClearing } = require("./clearing");
+// CHAIN TRUTH (CROWN 2026-11-26, LEDGER-AMOUNT-CHAIN-DRIFT): revenue figures
+// come from receipt-verified transfer values, never from telemetry list price.
+const { settledAmount, chainCorrection, setCorrection, listCorrections } = require("./chain-truth");
 
 const PORT = process.env.PORT || 3000;
 const COLLECTOR_KEY = process.env.COLLECTOR_KEY || "";
@@ -66,7 +69,8 @@ app.get("/ledger.json", (_req, res) => {
   let lastUpdated = 0;
   const transactions = [];
   for (const e of verified) {
-    const amount = e.price_usd || 0;
+    const amount = settledAmount(e); // chain-verified transfer value when reconciled (TRUTH)
+    const corrected = Boolean(chainCorrection(e));
     if (e.ts > lastUpdated) lastUpdated = e.ts;
     const internal = isInternalPayer(e.payer);
     const attributed = Boolean(e.payer && e.tx);
@@ -85,6 +89,8 @@ app.get("/ledger.json", (_req, res) => {
     transactions.push({
       service: e.service, route: e.route, ts: e.ts,
       amount_usd: amount, payer: e.payer || null, tx: e.tx || null,
+      amount_source: corrected ? "chain-verified-receipt" : "service-telemetry-list-price",
+      quoted_usd: corrected ? (e.price_usd || 0) : undefined,
       classification: internal ? "internal" : (attributed ? "external" : "unattributed"),
       payer_label: internal
         ? (internalWallets.labels[String(e.payer).toLowerCase()] || "RAEN test")
@@ -94,7 +100,7 @@ app.get("/ledger.json", (_req, res) => {
   // unverified = settled events with no tx hash (telemetry-only, not on-chain money)
   let unverifiedCount = 0, unverifiedUsd = 0;
   for (const e of settled) {
-    if (!e.tx) { unverifiedCount += 1; unverifiedUsd += e.price_usd || 0; }
+    if (!e.tx) { unverifiedCount += 1; unverifiedUsd += settledAmount(e); }
   }
   const r4 = (n) => Math.round(n * 10000) / 10000;
   res.json({
@@ -170,6 +176,24 @@ app.post("/events", (req, res) => {
   res.json({ ok: true });
 });
 
+// CHAIN-TRUTH CORRECTIONS (CROWN 2026-11-26): receipt-verified amounts override
+// telemetry list prices. Public read; key-gated write (no secret is ever displayed).
+app.get("/ops/chain-corrections", (_req, res) => res.json({
+  note: "receipt-verified settled amounts; these override telemetry price_usd in all revenue surfaces",
+  corrections: listCorrections(),
+}));
+app.post("/ops/chain-correct", (req, res) => {
+  const secret = REPORT_CRON_SECRET || COLLECTOR_KEY;
+  if (!secret) return res.status(503).json({ ok: false, error: "correction endpoint unconfigured" });
+  const supplied = req.get("x-report-secret") || req.get("x-collector-key") || "";
+  if (supplied !== secret) return res.status(401).json({ ok: false, error: "unauthorized" });
+  const b = req.body || {};
+  const out = setCorrection(b.tx, b.amount_usd, b.evidence);
+  res.status(out.ok ? 200 : 400).json(out.ok
+    ? { ...out, note: "correction applied to /ledger.json, /stats, /certify and value reports" }
+    : out);
+});
+
 // Aggregates: overall + per-service funnel and revenue estimate
 app.get("/stats", (_req, res) => {
   const day = Date.now() - 86400000;
@@ -184,10 +208,10 @@ app.get("/stats", (_req, res) => {
     // tx-verified settles only; internal splits into its own field.
     const externalVerified = verified.filter(e => !isInternalPayer(e.payer));
     const internalVerified = verified.filter(e => isInternalPayer(e.payer));
-    const revenue = externalVerified.reduce((s, e) => s + (e.price_usd || 0), 0);
-    const internalRevenue = internalVerified.reduce((s, e) => s + (e.price_usd || 0), 0);
+    const revenue = externalVerified.reduce((s, e) => s + settledAmount(e), 0);
+    const internalRevenue = internalVerified.reduce((s, e) => s + settledAmount(e), 0);
     const unverifiedRevenue = list.filter(e => e.event === "settled" && !e.tx)
-      .reduce((s, e) => s + (e.price_usd || 0), 0);
+      .reduce((s, e) => s + settledAmount(e), 0);
     const lat = list.filter(e => e.event === "settled" && e.latency_ms > 0)
       .map(e => e.latency_ms).sort((a, b) => a - b);
     return {
